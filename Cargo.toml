@@ -1,0 +1,75 @@
+[package]
+name    = "pgTool"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "pgqb"
+path = "src/main.rs"
+
+[dependencies]
+# ── async runtime ─────────────────────────────
+tokio        = { version = "1", features = ["full"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+
+# ── postgres driver ───────────────────────────
+sqlx         = { version = "0.8", features = [
+    "postgres",
+    "runtime-tokio-native-tls",
+    "macros",
+    "migrate",
+    "uuid",
+    "chrono",
+] }
+
+# ── GUI framework ─────────────────────────────
+eframe       = { version = "0.29", features = [
+    "persistence",          # save window size/position between runs
+] }
+egui         = "0.29"
+egui_extras  = { version = "0.29" }
+
+# ── async bridge for egui ─────────────────────
+# lets you fire off tokio tasks and poll results each frame
+poll-promise = { version = "0.3", features = ["tokio"] }
+
+# ── SQL query builder ─────────────────────────
+sea-query    = { version = "0.31", features = ["backend-postgres"] }
+
+# ── config & env ──────────────────────────────
+dotenvy      = "0.15"
+
+# ── type support for sqlx decoding ────────────
+uuid         = { version = "1", features = ["v4"] }
+chrono       = "0.4"
+
+# ── OS integration ────────────────────────────
+dirs         = "5"
+
+# ── error handling ────────────────────────────
+anyhow       = "1"
+thiserror    = "1"
+
+# ── serialization ─────────────────────────────
+serde        = { version = "1", features = ["derive"] }
+serde_json   = "1"
+
+# ── logging ───────────────────────────────────
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+pretty_assertions = "1"
+
+[build-dependencies]
+winresource = "0.1"
+
+[profile.release]
+panic         = "abort"
+codegen-units = 1
+opt-level     = "s"
+lto           = true
+strip         = true
+
+[profile.dev]
+incremental = true
