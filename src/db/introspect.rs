@@ -49,10 +49,19 @@ pub async fn load_schemas(pool: &PgPool) -> Result<Vec<SchemaInfo>> {
 }
 
 async fn load_tables(pool: &PgPool, schema: &str) -> Result<Vec<TableInfo>> {
+    // reltuples is the planner's estimate: -1 means "never analyzed"
+    // (unknown), >= 0 is an approximate row count. Joining pg_class here
+    // avoids one COUNT(*) round trip per table.
     let table_rows = sqlx::query(
-        "SELECT table_name FROM information_schema.tables
-         WHERE table_schema = $1 AND table_type = 'BASE TABLE'
-         ORDER BY table_name",
+        "SELECT t.table_name,
+                CASE WHEN c.reltuples >= 0 THEN c.reltuples::bigint END AS est_rows
+         FROM information_schema.tables t
+         LEFT JOIN pg_namespace n ON n.nspname = t.table_schema
+         LEFT JOIN pg_class c
+              ON c.relnamespace = n.oid AND c.relname = t.table_name
+             AND c.relkind IN ('r','p')
+         WHERE t.table_schema = $1 AND t.table_type = 'BASE TABLE'
+         ORDER BY t.table_name",
     )
     .bind(schema)
     .fetch_all(pool)
@@ -67,6 +76,7 @@ async fn load_tables(pool: &PgPool, schema: &str) -> Result<Vec<TableInfo>> {
             schema: schema.to_string(),
             name: table_name,
             columns,
+            row_count: tr.get("est_rows"),
         });
     }
 

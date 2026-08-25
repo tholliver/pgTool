@@ -17,6 +17,7 @@ pub fn show(
     theme: &Theme,
     page: u64,
     has_next_page: bool,
+    rows_returned: usize,
     busy: bool,
 ) -> Option<Action> {
     let mut action = None;
@@ -26,9 +27,13 @@ pub fn show(
         if ui
             .add_enabled(
                 !busy && page > 0,
-                egui::Button::new(egui::RichText::new("\u{25C0} Prev").color(theme.text).size(12.0))
-                    .fill(theme.surface)
-                    .rounding(4.0),
+                egui::Button::new(
+                    egui::RichText::new(egui_phosphor::regular::CARET_LEFT)
+                        .color(theme.text)
+                        .size(13.0),
+                )
+                .fill(theme.surface)
+                .corner_radius(4),
             )
             .clicked()
         {
@@ -45,35 +50,49 @@ pub fn show(
         if ui
             .add_enabled(
                 !busy && has_next_page,
-                egui::Button::new(egui::RichText::new("Next \u{25B6}").color(theme.text).size(12.0))
-                    .fill(theme.surface)
-                    .rounding(4.0),
+                egui::Button::new(
+                    egui::RichText::new(egui_phosphor::regular::CARET_RIGHT)
+                        .color(theme.text)
+                        .size(13.0),
+                )
+                .fill(theme.surface)
+                .corner_radius(4),
             )
             .clicked()
         {
             action = Some(Action::Next);
         }
 
-        ui.separator();
+        ui.label(
+            egui::RichText::new(format!("\u{00B7} {rows_returned} rows"))
+                .color(theme.text_muted)
+                .size(11.5),
+        );
 
-        // Page-size buttons — reset to the first page when changed
-        for limit in &["50", "100", "1000"] {
-            if ui
-                .add(
-                    egui::Button::new(
-                        egui::RichText::new(*limit)
-                            .color(theme.text_muted)
-                            .monospace()
-                            .size(11.0),
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            for limit in ["1000", "100", "50"] {
+                if ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new(limit)
+                                .color(theme.text_muted)
+                                .monospace()
+                                .size(11.0),
+                        )
+                        .fill(theme.surface)
+                        .corner_radius(4),
                     )
-                    .fill(theme.surface)
-                    .rounding(4.0),
-                )
-                .clicked()
-            {
-                action = Some(Action::Limit(limit));
+                    .clicked()
+                {
+                    action = Some(Action::Limit(limit));
+                }
             }
-        }
+            ui.label(
+                egui::RichText::new("rows per page")
+                    .color(theme.text_muted)
+                    .size(10.5),
+            );
+        });
     });
 
     action

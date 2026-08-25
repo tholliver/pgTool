@@ -1,1 +1,18 @@
+# Build artifacts
 /target
+
+# Local secrets / environment (contains DB credentials)
+.env
+
+# Editor / OS junk
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Stray archives
+*.zip
+
+# Debug symbols (generated next to the exe)
+*.pdb

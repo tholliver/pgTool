@@ -10,6 +10,22 @@ pub enum Focus {
     Tables,
 }
 
+/// What kind of identifier an autocomplete candidate is; drives ranking
+/// (tables first) and the popup's row icon.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CandidateKind {
+    Schema,
+    Table,
+    Column,
+}
+
+/// One autocomplete suggestion: an identifier plus its kind.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Candidate {
+    pub name: String,
+    pub kind: CandidateKind,
+}
+
 /// Lazy connect+introspect promise for one expanded database:
 /// resolves to (pool, schemas) for the keyed database name.
 type DbSchemaPromise = Promise<anyhow::Result<(PgPool, Vec<db::SchemaInfo>)>>;
@@ -171,22 +187,132 @@ pub struct QueryState {
     /// True when the last fetch returned a full page (probably more rows).
     pub has_next_page: bool,
     pub filter_text: String,
+    /// Sidebar tree filter (matches table names, case-insensitive).
+    pub tree_filter: String,
+    /// SQL awaiting an explicit "run anyway" from the destructive-statement
+    /// confirm dialog; None when no confirmation is pending.
+    pub pending_confirm_sql: Option<String>,
+    /// Abort handle for the running query task (cancellation).
+    pub query_cancel: Option<tokio::task::AbortHandle>,
+    /// Live autocomplete suggestions for the word under the caret (max 8).
+    pub autocomplete_matches: Vec<Candidate>,
+    /// Byte range in `sql` that a chosen suggestion replaces.
+    pub autocomplete_splice: Option<std::ops::Range<usize>>,
+    /// True when the caret word has live suggestions and the floating
+    /// autocomplete popup is shown.
+    pub autocomplete_open: bool,
+    /// Highlighted row in the autocomplete popup.
+    pub autocomplete_selected: usize,
+    /// Caret position (in chars) to restore in the SQL editor after an
+    /// autocomplete insert; consumed by the UI on the next editor draw.
+    pub pending_caret: Option<usize>,
+    /// The SQL editor's real egui id, captured from its TextEditOutput each
+    /// frame (`id_salt` is hashed, so it cannot be fabricated elsewhere).
+    pub editor_id: Option<egui::Id>,
     /// Fraction of the shared editor/results split given to the SQL editor (0.0–1.0).
     pub results_split_ratio: f32,
     pub expanded_schemas: std::collections::HashSet<usize>,
     /// Schema expansion scoped per database in browse-all mode: (db, schema_idx).
     pub expanded_db_schemas: std::collections::HashSet<(String, usize)>,
     pub expanded_connections: std::collections::HashSet<String>,
+    /// Wall-clock time the last query was dispatched; consumed (taken) once
+    /// the promise resolves, to compute `last_run_duration`.
+    pub last_run_started_at: Option<std::time::Instant>,
+    /// How long the most recently finished query took, success or failure.
+    pub last_run_duration: Option<std::time::Duration>,
+    /// Queries dispatched this session (process lifetime, not persisted).
+    pub session_query_count: u32,
+    /// Queries that finished in error this session.
+    pub session_failed_count: u32,
+    /// Structured detail for the most recent failure; cleared once a new
+    /// query is dispatched, a query succeeds, or the connection changes.
+    pub last_error: Option<crate::db::QueryError>,
+    /// Whether the error panel's full-detail view is open.
+    pub error_detail_expanded: bool,
+}
+
+impl Default for QueryState {
+    fn default() -> Self {
+        Self {
+            schemas: Vec::new(),
+            databases: Vec::new(),
+            database_pools: std::collections::HashMap::new(),
+            expanded_databases: std::collections::HashSet::new(),
+            active_database: None,
+            schema_idx: 0,
+            table_idx: 0,
+            focus: Focus::Schemas,
+            sql: String::new(),
+            result: None,
+            status: String::new(),
+            schema_promise: None,
+            query_promise: None,
+            database_promise: None,
+            db_schema_promise: None,
+            limit_value: "100".into(),
+            offset_value: "0".into(),
+            current_page: 0,
+            has_next_page: false,
+            filter_text: String::new(),
+            tree_filter: String::new(),
+            pending_confirm_sql: None,
+            query_cancel: None,
+            autocomplete_matches: Vec::new(),
+            autocomplete_splice: None,
+            autocomplete_open: false,
+            autocomplete_selected: 0,
+            pending_caret: None,
+            editor_id: None,
+            results_split_ratio: 0.5,
+            expanded_schemas: std::collections::HashSet::new(),
+            expanded_db_schemas: std::collections::HashSet::new(),
+            expanded_connections: std::collections::HashSet::new(),
+            last_run_started_at: None,
+            last_run_duration: None,
+            session_query_count: 0,
+            session_failed_count: 0,
+            last_error: None,
+            error_detail_expanded: false,
+        }
+    }
+}
+
+impl QueryState {
+    /// Call exactly once, right before spawning a query task.
+    pub fn record_query_dispatch(&mut self) {
+        self.session_query_count += 1;
+        self.last_run_started_at = Some(std::time::Instant::now());
+        self.last_error = None;
+        self.error_detail_expanded = false;
+    }
+
+    /// Call in the `Ok` arm of the query-promise poll.
+    pub fn record_query_success(&mut self) {
+        if let Some(started) = self.last_run_started_at.take() {
+            self.last_run_duration = Some(started.elapsed());
+        }
+    }
+
+    /// Call in the `Err` arm of the query-promise poll.
+    pub fn record_query_failure(&mut self, err: &anyhow::Error) {
+        if let Some(started) = self.last_run_started_at.take() {
+            self.last_run_duration = Some(started.elapsed());
+        }
+        self.session_failed_count += 1;
+        self.last_error = Some(crate::db::QueryError::from_anyhow(err));
+    }
 }
 
 pub struct AppState {
     pub connection: ConnectionState,
     pub query: QueryState,
     pub connect_promise: Option<Promise<Result<PgPool, anyhow::Error>>>,
+    /// Shared tokio runtime; query tasks spawn here so they can be aborted.
+    pub rt: std::sync::Arc<tokio::runtime::Runtime>,
 }
 
 impl AppState {
-    pub fn new() -> Self {
+    pub fn new(rt: std::sync::Arc<tokio::runtime::Runtime>) -> Self {
         let profiles = crate::connections::load_profiles().unwrap_or_default();
         Self {
             connection: ConnectionState {
@@ -196,33 +322,9 @@ impl AppState {
                 dialog: ConnectionDialog::default(),
                 menu_open: false,
             },
-            query: QueryState {
-                schemas: Vec::new(),
-                databases: Vec::new(),
-                database_pools: std::collections::HashMap::new(),
-                expanded_databases: std::collections::HashSet::new(),
-                active_database: None,
-                schema_idx: 0,
-                table_idx: 0,
-                focus: Focus::Schemas,
-                sql: String::new(),
-                result: None,
-                status: String::new(),
-                schema_promise: None,
-                query_promise: None,
-                database_promise: None,
-                db_schema_promise: None,
-                limit_value: "100".into(),
-                offset_value: "0".into(),
-                current_page: 0,
-                has_next_page: false,
-                filter_text: String::new(),
-                results_split_ratio: 0.5,
-                expanded_schemas: std::collections::HashSet::new(),
-                expanded_db_schemas: std::collections::HashSet::new(),
-                expanded_connections: std::collections::HashSet::new(),
-            },
+            query: QueryState::default(),
             connect_promise: None,
+            rt,
         }
     }
 
@@ -279,15 +381,36 @@ impl AppState {
     /// Lazily opens a second connection scoped to that database and loads
     /// its schemas; reuses an already-open pool on subsequent expands.
     pub fn expand_database(&mut self, db_name: &str) {
-        if self.query.database_pools.contains_key(db_name) {
+        let already_loaded = self
+            .query
+            .databases
+            .iter()
+            .find(|d| d.name == db_name)
+            .map(|d| d.loaded)
+            .unwrap_or(false);
+        if already_loaded {
             return;
         }
-        // Only one lazy connect at a time — don't clobber an in-flight one.
+        // Only one lazy connect/reload at a time — don't clobber an in-flight one.
         if let Some((pending_name, promise)) = &self.query.db_schema_promise
             && (pending_name == db_name || promise.ready().is_none())
         {
             return;
         }
+
+        if let Some(pool) = self.query.database_pools.get(db_name).cloned() {
+            let db_name_owned = db_name.to_string();
+            self.query.status = format!("Loading schemas for {db_name}...");
+            self.query.db_schema_promise = Some((
+                db_name_owned,
+                Promise::spawn_async(async move {
+                    let schemas = db::load_schemas(&pool).await?;
+                    Ok((pool, schemas))
+                }),
+            ));
+            return;
+        }
+
         let Some(profile_id) = self.connection.active_id.clone() else {
             return;
         };
@@ -354,15 +477,23 @@ impl AppState {
         self.query.table_idx = 0;
         self.query.sql.clear();
         self.query.result = None;
+        self.close_autocomplete();
         self.query.schema_promise = None;
         self.query.database_promise = None;
         self.query.db_schema_promise = None;
         self.query.query_promise = None;
+        self.query.query_cancel = None;
+        self.query.pending_confirm_sql = None;
         self.query.current_page = 0;
         self.query.has_next_page = false;
         self.query.filter_text.clear();
         self.query.expanded_schemas.clear();
         self.query.expanded_db_schemas.clear();
+        // The error panel describes a failure against the *old* connection;
+        // drop it on switch. Session counters are process-scoped and stay.
+        self.query.last_error = None;
+        self.query.error_detail_expanded = false;
+        self.query.last_run_started_at = None;
     }
 
     pub fn poll_promises(&mut self) -> bool {
@@ -462,12 +593,7 @@ impl AppState {
         }
         if let Some((name, pool, schemas)) = db_loaded {
             self.query.database_pools.insert(name.clone(), pool);
-            if let Some(info) = self
-                .query
-                .databases
-                .iter_mut()
-                .find(|d| d.name == name)
-            {
+            if let Some(info) = self.query.databases.iter_mut().find(|d| d.name == name) {
                 info.schemas = schemas;
                 info.loaded = true;
             }
@@ -501,11 +627,16 @@ impl AppState {
             }
         }
 
-        // Poll query promise
-        if let Some(p) = &self.query.query_promise {
+        // Poll query promise. Taken out so the record_* helpers (which take
+        // &mut QueryState) don't fight the in-progress borrow of the field;
+        // restored immediately when still pending.
+        if let Some(p) = self.query.query_promise.take() {
             match p.ready() {
-                None => {}
+                None => {
+                    self.query.query_promise = Some(p);
+                }
                 Some(Ok(result)) => {
+                    self.query.record_query_success();
                     let rows = result.rows.len();
                     // A full page means there are probably more rows after it.
                     let limit: u64 = self.query.limit_value.parse().unwrap_or(100);
@@ -515,12 +646,11 @@ impl AppState {
                         "{rows} rows returned \u{2014} page {}",
                         self.query.current_page + 1
                     );
-                    self.query.query_promise = None;
                     changed = true;
                 }
                 Some(Err(e)) => {
+                    self.query.record_query_failure(e);
                     self.query.status = format!("Query error: {e}");
-                    self.query.query_promise = None;
                     changed = true;
                 }
             }
@@ -548,21 +678,64 @@ impl AppState {
         }
     }
 
+    /// `(total_connections, idle_connections)` for the pool queries would
+    /// currently run against, if one exists. Synchronous — sqlx exposes
+    /// pool size/idle counts without an await.
+    pub fn pool_stats(&self) -> Option<(u32, usize)> {
+        let pool = self.query_pool()?;
+        Some((pool.size(), pool.num_idle()))
+    }
+
     pub fn run_query(&mut self) {
+        if self.query.sql.trim().is_empty() {
+            return;
+        }
+        // Destructive statements need one explicit confirmation per edit;
+        // the dialog clears the flag before re-running via confirm_run().
+        if Self::is_destructive(&self.query.sql) && self.query.pending_confirm_sql.is_none() {
+            self.query.pending_confirm_sql = Some(self.query.sql.clone());
+            return;
+        }
+        self.execute_current_query();
+    }
+
+    /// "Run anyway" from the confirm dialog: bypasses the guard.
+    pub fn confirm_run(&mut self) {
+        self.query.pending_confirm_sql = None;
+        self.execute_current_query();
+    }
+
+    /// Starts with a data-modifying keyword? (Plain prefix check on the
+    /// trimmed, uppercased statement — CTEs/comments are not handled.)
+    fn is_destructive(sql: &str) -> bool {
+        let trimmed = sql.trim_start().to_uppercase();
+        const KEYWORDS: &[&str] = &["DELETE", "UPDATE", "TRUNCATE", "DROP", "ALTER"];
+        KEYWORDS.iter().any(|k| trimmed.starts_with(k))
+    }
+
+    fn execute_current_query(&mut self) {
         if self.query.sql.trim().is_empty() {
             return;
         }
         match self.query_pool() {
             Some(pool) => {
                 let sql = self.query.sql.clone();
+                self.query.record_query_dispatch();
                 self.query.status = "Running query...".into();
                 // A fresh query always starts at the first page.
                 self.query.current_page = 0;
                 self.query.has_next_page = false;
                 // Snap the editor/results split back to 50/50 on every fresh run.
                 self.query.results_split_ratio = 0.5;
+                let handle = self
+                    .rt
+                    .spawn(async move { db::execute_query(&pool, &sql).await });
+                self.query.query_cancel = Some(handle.abort_handle());
                 self.query.query_promise = Some(Promise::spawn_async(async move {
-                    db::execute_query(&pool, &sql).await
+                    match handle.await {
+                        Ok(res) => res,
+                        Err(_) => Err(anyhow::anyhow!("query was cancelled")),
+                    }
                 }));
             }
             None => {
@@ -582,10 +755,18 @@ impl AppState {
         let limit: u64 = self.query.limit_value.parse().unwrap_or(100);
         let offset = page * limit;
         let sql = self.paginate_sql(limit, offset);
+        self.query.record_query_dispatch();
         self.query.status = format!("Loading page {}...", page + 1);
         self.query.current_page = page;
+        let handle = self
+            .rt
+            .spawn(async move { db::execute_query(&pool, &sql).await });
+        self.query.query_cancel = Some(handle.abort_handle());
         self.query.query_promise = Some(Promise::spawn_async(async move {
-            db::execute_query(&pool, &sql).await
+            match handle.await {
+                Ok(res) => res,
+                Err(_) => Err(anyhow::anyhow!("query was cancelled")),
+            }
         }));
     }
 
@@ -630,6 +811,98 @@ impl AppState {
     pub fn selected_table(&self) -> Option<&db::TableInfo> {
         self.selected_schema()
             .and_then(|s| s.tables.get(self.query.table_idx))
+    }
+
+    /// Flat identifier list for autocomplete: schema, table and column names
+    /// from whatever tree is currently loaded. Tagged by kind, deduped,
+    /// sorted case-insensitively (relevance ranking happens at filter time).
+    pub fn autocomplete_candidates(&self) -> Vec<Candidate> {
+        let schemas: &[db::SchemaInfo] = if self.browse_all_active() {
+            match self.query.active_database.as_deref() {
+                Some(name) => self
+                    .query
+                    .databases
+                    .iter()
+                    .find(|d| d.name == name)
+                    .map(|d| d.schemas.as_slice())
+                    .unwrap_or(&[]),
+                None => &[],
+            }
+        } else {
+            &self.query.schemas
+        };
+
+        let mut out: Vec<Candidate> = Vec::new();
+        for s in schemas {
+            out.push(Candidate {
+                name: s.name.clone(),
+                kind: CandidateKind::Schema,
+            });
+            for t in &s.tables {
+                out.push(Candidate {
+                    name: t.name.clone(),
+                    kind: CandidateKind::Table,
+                });
+                for c in &t.columns {
+                    out.push(Candidate {
+                        name: c.name.clone(),
+                        kind: CandidateKind::Column,
+                    });
+                }
+            }
+        }
+        out.sort_by_key(|a| a.name.to_lowercase());
+        out.dedup_by(|a, b| a.name.eq_ignore_ascii_case(&b.name) && a.kind == b.kind);
+        out
+    }
+
+    /// Splice a chosen suggestion over the word under the caret. Returns the
+    /// new caret position in chars (egui's `CCursor` is char-indexed), or
+    /// `None` when nothing was spliced.
+    pub fn autocomplete_insert(&mut self, choice: &str) -> Option<usize> {
+        let range = self.query.autocomplete_splice.take()?;
+        if range.start > range.end || range.end > self.query.sql.len() {
+            self.query.autocomplete_matches.clear();
+            self.query.autocomplete_open = false;
+            return None;
+        }
+        self.query.sql.replace_range(range.clone(), choice);
+        self.query.autocomplete_matches.clear();
+        self.query.autocomplete_open = false;
+
+        // char count up to the end of the just-inserted text
+        let end_byte = range.start + choice.len();
+        let new_char_idx = self.query.sql[..end_byte].chars().count();
+        Some(new_char_idx)
+    }
+
+    /// Dismiss the autocomplete popup and forget its suggestions.
+    pub fn close_autocomplete(&mut self) {
+        self.query.autocomplete_open = false;
+        self.query.autocomplete_matches.clear();
+        self.query.autocomplete_selected = 0;
+        self.query.autocomplete_splice = None;
+    }
+
+    /// Move the popup's highlighted row by `delta`, clamped to the list.
+    pub fn move_autocomplete_selection(&mut self, delta: isize) {
+        let len = self.query.autocomplete_matches.len();
+        if len == 0 {
+            return;
+        }
+        let next = self.query.autocomplete_selected as isize + delta;
+        self.query.autocomplete_selected = next.clamp(0, len as isize - 1) as usize;
+    }
+
+    /// Insert the currently highlighted suggestion into the query. Returns
+    /// the new caret position in chars, if a suggestion was inserted.
+    pub fn accept_autocomplete(&mut self) -> Option<usize> {
+        let choice = self
+            .query
+            .autocomplete_matches
+            .get(self.query.autocomplete_selected)
+            .cloned()?;
+        self.autocomplete_insert(&choice.name)
     }
 
     pub fn select_table(&mut self, si: usize, ti: usize) {
@@ -680,5 +953,95 @@ impl AppState {
         } else {
             format!("{} LIMIT {} OFFSET {}", trimmed, new_limit, new_offset)
         }
+    }
+}
+
+#[cfg(test)]
+mod query_tracking_tests {
+    use super::*;
+
+    /// The three record_query_* methods live on QueryState (not AppState)
+    /// precisely so they're testable without a tokio runtime or PgPool.
+    #[test]
+    fn dispatch_increments_count_and_clears_previous_error() {
+        let mut q = QueryState {
+            last_error: Some(crate::db::QueryError {
+                headline: "old".into(),
+                detail: "old".into(),
+            }),
+            error_detail_expanded: true,
+            ..QueryState::default()
+        };
+
+        q.record_query_dispatch();
+
+        assert_eq!(q.session_query_count, 1);
+        assert!(
+            q.last_error.is_none(),
+            "a new dispatch clears the old error"
+        );
+        assert!(!q.error_detail_expanded);
+        assert!(q.last_run_started_at.is_some());
+    }
+
+    #[test]
+    fn failure_increments_failed_count_and_sets_error() {
+        let mut q = QueryState::default();
+        q.record_query_dispatch();
+        let err = anyhow::anyhow!("syntax error at or near \"on\"");
+
+        q.record_query_failure(&err);
+
+        assert_eq!(q.session_failed_count, 1);
+        assert_eq!(
+            q.last_error.as_ref().map(|e| e.headline.as_str()),
+            Some("syntax error at or near \"on\"")
+        );
+        assert!(
+            q.last_run_duration.is_some(),
+            "failure also records duration"
+        );
+        assert!(q.last_run_started_at.is_none(), "started_at is consumed");
+    }
+
+    #[test]
+    fn success_records_duration_and_consumes_started_at() {
+        let mut q = QueryState::default();
+        q.record_query_dispatch();
+
+        q.record_query_success();
+
+        assert_eq!(
+            q.session_failed_count, 0,
+            "success must not count as failure"
+        );
+        assert!(q.last_run_duration.is_some());
+        assert!(q.last_run_started_at.is_none());
+    }
+
+    #[test]
+    fn success_clears_previous_error() {
+        // A query that succeeds after a failure closes the error panel.
+        let mut q = QueryState::default();
+        q.record_query_dispatch();
+        q.record_query_failure(&anyhow::anyhow!("boom"));
+        assert!(q.last_error.is_some());
+
+        q.record_query_dispatch();
+        q.record_query_success();
+
+        assert!(q.last_error.is_none(), "success path leaves no error panel");
+    }
+
+    #[test]
+    fn success_without_dispatch_is_a_no_op() {
+        // Poll safety: record_query_success/failure may only fire once per
+        // promise, but a second call (or one with no dispatch) must not
+        // panic or corrupt counters.
+        let mut q = QueryState::default();
+        q.record_query_success();
+        q.record_query_failure(&anyhow::anyhow!("late"));
+        assert_eq!(q.session_failed_count, 1);
+        assert!(q.last_run_duration.is_none());
     }
 }

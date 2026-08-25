@@ -10,6 +10,12 @@ pub struct Theme {
     pub accent_muted: egui::Color32,
     pub success: egui::Color32,
     pub danger: egui::Color32,
+    // -- SQL syntax highlighting --
+    pub sql_keyword: egui::Color32,
+    pub sql_string: egui::Color32,
+    pub sql_number: egui::Color32,
+    pub sql_identifier: egui::Color32,
+    pub sql_comment: egui::Color32,
 }
 
 pub const DARK_ZINC_PURPLE: Theme = Theme {
@@ -24,6 +30,11 @@ pub const DARK_ZINC_PURPLE: Theme = Theme {
     accent_muted: egui::Color32::from_rgb(0x2e, 0x1f, 0x47),
     success: egui::Color32::from_rgb(0x22, 0xc5, 0x5e),
     danger: egui::Color32::from_rgb(0xef, 0x44, 0x44),
+    sql_keyword: egui::Color32::from_rgb(0xc5, 0x86, 0xc0),
+    sql_string: egui::Color32::from_rgb(0xce, 0x91, 0x78),
+    sql_number: egui::Color32::from_rgb(0xb5, 0xce, 0xa8),
+    sql_identifier: egui::Color32::from_rgb(0x9c, 0xdc, 0xfe),
+    sql_comment: egui::Color32::from_rgb(0x6a, 0x99, 0x55),
 };
 
 impl Theme {
@@ -34,20 +45,20 @@ impl Theme {
                 .strong(),
         )
         .fill(self.accent)
-        .rounding(6.0)
+        .corner_radius(6)
     }
 
     pub fn surface_frame(&self) -> egui::Frame {
-        egui::Frame::none()
+        egui::Frame::new()
             .fill(self.surface)
-            .rounding(8.0)
-            .inner_margin(egui::Margin::symmetric(12.0, 8.0))
+            .corner_radius(8)
+            .inner_margin(egui::Margin::symmetric(12, 8))
             .stroke(egui::Stroke::new(1.0, self.border))
     }
 
     pub fn panel_frame(&self) -> egui::Frame {
-        egui::Frame::none()
+        egui::Frame::new()
             .fill(self.panel)
-            .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+            .inner_margin(egui::Margin::symmetric(8, 4))
     }
 }

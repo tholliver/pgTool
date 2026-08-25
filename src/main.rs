@@ -23,7 +23,13 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1400.0, 900.0])
-            .with_title("pgTool -- PostgreSQL Browser"),
+            .with_min_inner_size([520.0, 380.0])
+            .with_title("pgTool -- PostgreSQL Browser")
+            // Window/taskbar icon (exe-file icon comes from build.rs).
+            .with_icon(ui::appicon::icon_data())
+            // No OS chrome: the app paints its own always-dark titlebar
+            // (close/max/min), immune to Windows light/dark theme flips.
+            .with_decorations(false),
         ..Default::default()
     };
 

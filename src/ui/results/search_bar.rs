@@ -19,13 +19,9 @@ pub fn show(ui: &mut egui::Ui, filter_text: &mut String, theme: &Theme) {
         if !filter_text.is_empty() {
             if ui
                 .add(
-                    egui::Button::new(
-                        egui::RichText::new("×")
-                            .color(theme.text_muted)
-                            .size(14.0),
-                    )
-                    .fill(egui::Color32::TRANSPARENT)
-                    .rounding(4.0),
+                    egui::Button::new(egui::RichText::new("×").color(theme.text_muted).size(14.0))
+                        .fill(egui::Color32::TRANSPARENT)
+                        .corner_radius(4),
                 )
                 .on_hover_text("Clear filter")
                 .clicked()

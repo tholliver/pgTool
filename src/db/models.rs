@@ -17,6 +17,9 @@ pub struct TableInfo {
     pub schema: String,
     pub name: String,
     pub columns: Vec<ColumnInfo>,
+    /// Planner's row estimate from pg_class.reltuples; None when unknown
+    /// (table never analyzed). An estimate, not an exact count.
+    pub row_count: Option<i64>,
 }
 
 #[derive(Debug, Clone)]

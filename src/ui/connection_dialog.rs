@@ -11,9 +11,12 @@ pub fn show(ctx: &egui::Context, dialog: &mut ConnectionDialog, theme: &Theme) {
     egui::Area::new(egui::Id::new("dialog_backdrop"))
         .order(egui::Order::Foreground)
         .show(ctx, |ui| {
-            let screen = ui.ctx().screen_rect();
-            ui.painter()
-                .rect_filled(screen, egui::Rounding::ZERO, egui::Color32::from_rgba_premultiplied(0, 0, 0, 150));
+            let screen = ui.input(|i| i.viewport_rect());
+            ui.painter().rect_filled(
+                screen,
+                egui::CornerRadius::ZERO,
+                egui::Color32::from_rgba_premultiplied(0, 0, 0, 150),
+            );
         });
 
     let title = if dialog.editing_id.is_some() {
@@ -27,10 +30,10 @@ pub fn show(ctx: &egui::Context, dialog: &mut ConnectionDialog, theme: &Theme) {
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .frame(
-            egui::Frame::none()
+            egui::Frame::new()
                 .fill(theme.panel)
-                .rounding(8.0)
-                .inner_margin(egui::Margin::symmetric(24.0, 20.0))
+                .corner_radius(8)
+                .inner_margin(egui::Margin::symmetric(24, 20))
                 .stroke(egui::Stroke::new(1.0, theme.border)),
         )
         .show(ctx, |ui| {
@@ -108,11 +111,7 @@ pub fn show(ctx: &egui::Context, dialog: &mut ConnectionDialog, theme: &Theme) {
                 .selected_text(dialog.ssl_mode.as_str())
                 .show_ui(ui, |ui| {
                     for mode in SslMode::all() {
-                        ui.selectable_value(
-                            &mut dialog.ssl_mode,
-                            mode.clone(),
-                            mode.as_str(),
-                        );
+                        ui.selectable_value(&mut dialog.ssl_mode, mode.clone(), mode.as_str());
                     }
                 });
             ui.add_space(8.0);
@@ -136,7 +135,7 @@ pub fn show(ctx: &egui::Context, dialog: &mut ConnectionDialog, theme: &Theme) {
                             .strong(),
                     )
                     .fill(theme.accent)
-                    .rounding(6.0)
+                    .corner_radius(6)
                     .min_size(egui::vec2(130.0, 32.0)),
                 );
                 if btn.clicked() && !dialog.testing {
@@ -146,7 +145,7 @@ pub fn show(ctx: &egui::Context, dialog: &mut ConnectionDialog, theme: &Theme) {
                 if ui
                     .add(
                         egui::Button::new("Cancel")
-                            .rounding(6.0)
+                            .corner_radius(6)
                             .min_size(egui::vec2(80.0, 32.0)),
                     )
                     .clicked()
@@ -158,9 +157,5 @@ pub fn show(ctx: &egui::Context, dialog: &mut ConnectionDialog, theme: &Theme) {
 }
 
 fn field_label(ui: &mut egui::Ui, theme: &Theme, text: &str) {
-    ui.label(
-        egui::RichText::new(text)
-            .color(theme.text_muted)
-            .size(12.0),
-    );
+    ui.label(egui::RichText::new(text).color(theme.text_muted).size(12.0));
 }

@@ -13,6 +13,7 @@ pub fn show_panel(ui: &mut egui::Ui, state: &mut AppState, theme: &Theme) {
         // while row data borrowed from `state` is also in scope).
         let page = state.query.current_page;
         let has_next = state.query.has_next_page;
+        let rows_returned = state.query.result.as_ref().map(|r| r.rows.len()).unwrap_or(0);
         let busy = state.is_loading();
         let filter = state.query.filter_text.clone();
 
@@ -27,7 +28,7 @@ pub fn show_panel(ui: &mut egui::Ui, state: &mut AppState, theme: &Theme) {
         // so nothing can overflow the panel or leave dead space on resize.
         ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
             // drawn first -> sits at the bottom
-            action = pagination::show(ui, theme, page, has_next, busy);
+            action = pagination::show(ui, theme, page, has_next, rows_returned, busy);
 
             // switch back to top-down: ScrollArea/TableBuilder expect it
             ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
