@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use futures_util::TryStreamExt;
-use sqlx::{Column, PgPool, Row, ValueRef};
+use sqlx::{Column, PgPool, Row, TypeInfo, ValueRef};
 
 use super::models::QueryResult;
 
@@ -13,6 +13,7 @@ pub async fn execute_query(pool: &PgPool, sql: &str) -> Result<QueryResult> {
     let mut stream = sqlx::raw_sql(sql).fetch(pool);
 
     let mut columns: Vec<String> = Vec::new();
+    let mut column_types: Vec<String> = Vec::new();
     let mut rows: Vec<Vec<String>> = Vec::new();
 
     while let Some(row) = stream.try_next().await.context("query failed")? {
@@ -21,6 +22,11 @@ pub async fn execute_query(pool: &PgPool, sql: &str) -> Result<QueryResult> {
                 .columns()
                 .iter()
                 .map(|c| c.name().to_string())
+                .collect();
+            column_types = row
+                .columns()
+                .iter()
+                .map(|c| c.type_info().name().to_string())
                 .collect();
         }
 
@@ -47,9 +53,54 @@ pub async fn execute_query(pool: &PgPool, sql: &str) -> Result<QueryResult> {
 
     Ok(QueryResult {
         columns,
+        column_types,
         rows,
         rows_affected,
     })
+}
+
+/// Quote a PostgreSQL identifier for safe inline embedding. Identifiers are
+/// introspected from the schema catalogs (never raw user input), and wrapping
+/// them in double quotes handles reserved words and mixed case; embedded
+/// quotes are escaped by doubling.
+pub fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// UPDATE one cell of one row, identified by equality on the row's primary
+/// key. The new value and the PK values are bound as parameters so Postgres
+/// infers the column types from context (no client-side casting, no
+/// injection); identifiers come from the catalog. Returns rows affected.
+pub async fn execute_cell_update(
+    pool: &PgPool,
+    schema: &str,
+    table: &str,
+    column: &str,
+    value: &str,
+    identity: &[(String, String)],
+) -> Result<u64> {
+    debug_assert!(
+        !identity.is_empty(),
+        "a single-row UPDATE needs a WHERE predicate"
+    );
+
+    let table_ident = format!("{}.{}", quote_ident(schema), quote_ident(table));
+    let set_clause = format!("{} = $1", quote_ident(column));
+    let where_clause = identity
+        .iter()
+        .enumerate()
+        .map(|(i, (col, _))| format!("{} = ${}", quote_ident(col), i + 2))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let sql = format!("UPDATE {table_ident} SET {set_clause} WHERE {where_clause}");
+
+    let mut q = sqlx::query(&sql).bind(value);
+    for (_, v) in identity {
+        q = q.bind(v);
+    }
+
+    let res = q.execute(pool).await.context("cell update failed")?;
+    Ok(res.rows_affected() as u64)
 }
 
 #[cfg(test)]

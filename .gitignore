@@ -16,3 +16,8 @@ Thumbs.db
 
 # Debug symbols (generated next to the exe)
 *.pdb
+
+# macOS app bundle (build artifact from cargo + packaging)
+/pgqb.app
+/dist/
+*.icns

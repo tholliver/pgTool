@@ -229,6 +229,72 @@ pub struct QueryState {
     pub last_error: Option<crate::db::QueryError>,
     /// Whether the error panel's full-detail view is open.
     pub error_detail_expanded: bool,
+    /// Results grid selection `(row, column)` (0-based, into the rows as
+    /// displayed this frame). Currently drives copy; reserved as the anchor
+    /// for cell editing in a later release.
+    pub selected_cell: Option<(usize, usize)>,
+    /// Transient "copied cell" feedback shown in the results panel.
+    pub copy_feedback: Option<CopyFeedback>,
+    /// Modal cell-edit dialog (opened from the results grid context menu).
+    pub edit: EditDialog,
+}
+
+/// Short-lived notification that a cell value was copied to the clipboard;
+/// auto-clears a couple of seconds after it is posted.
+pub struct CopyFeedback {
+    pub text: String,
+    pub since: std::time::Instant,
+}
+
+/// Modal "Edit cell" dialog state (results grid → right-click → Edit cell).
+/// Safe by construction: editing is only offered when the result set is a
+/// plain projection of the currently selected table and that table has a
+/// primary key, so the generated UPDATE always targets exactly one row.
+pub struct EditDialog {
+    pub open: bool,
+    /// Row index into the current result set (stable across client-side
+    /// filtering).
+    pub row_idx: usize,
+    /// Column index into the current result set being edited.
+    pub col_idx: usize,
+    pub schema: String,
+    pub table: String,
+    pub column: String,
+    /// Type shown to the user (from the result set, e.g. "INT4").
+    pub column_type: String,
+    pub nullable: bool,
+    /// `(primary-key column, value)` pairs used to build the WHERE clause.
+    pub identity: Vec<(String, String)>,
+    /// Text currently in the value box (starts as the current cell text).
+    pub value: String,
+    /// True while the UPDATE is in flight (Save disabled).
+    pub saving: bool,
+    /// Structured failure from the last save attempt.
+    pub error: Option<crate::db::QueryError>,
+    /// Wetther the dialog's error detail panel is expanded.
+    pub detail_expanded: bool,
+    pub promise: Option<Promise<anyhow::Result<u64>>>,
+}
+
+impl Default for EditDialog {
+    fn default() -> Self {
+        Self {
+            open: false,
+            row_idx: 0,
+            col_idx: 0,
+            schema: String::new(),
+            table: String::new(),
+            column: String::new(),
+            column_type: String::new(),
+            nullable: true,
+            identity: Vec::new(),
+            value: String::new(),
+            saving: false,
+            error: None,
+            detail_expanded: false,
+            promise: None,
+        }
+    }
 }
 
 impl Default for QueryState {
@@ -273,6 +339,9 @@ impl Default for QueryState {
             session_failed_count: 0,
             last_error: None,
             error_detail_expanded: false,
+            selected_cell: None,
+            copy_feedback: None,
+            edit: EditDialog::default(),
         }
     }
 }
@@ -641,6 +710,10 @@ impl AppState {
                     // A full page means there are probably more rows after it.
                     let limit: u64 = self.query.limit_value.parse().unwrap_or(100);
                     self.query.has_next_page = rows as u64 == limit;
+                    // The result set was replaced, so cell coordinates and
+                    // any copy feedback no longer refer to the same data.
+                    self.query.selected_cell = None;
+                    self.query.copy_feedback = None;
                     self.query.result = Some(result.clone());
                     self.query.status = format!(
                         "{rows} rows returned \u{2014} page {}",
@@ -779,6 +852,131 @@ impl AppState {
     pub fn prev_page(&mut self) {
         if self.query.current_page > 0 {
             self.goto_page(self.query.current_page - 1);
+        }
+    }
+
+    /// Open the cell-edit dialog for a result cell. `identity` is the
+    /// `(primary-key column, value)` set that unambiguously locates the row;
+    /// the cell's current value seeds the value box.
+    pub fn open_edit_cell(
+        &mut self,
+        row_idx: usize,
+        col_idx: usize,
+        schema: &str,
+        table: &str,
+        column: &str,
+        column_type: &str,
+        nullable: bool,
+        identity: Vec<(String, String)>,
+    ) {
+        let current = self
+            .query
+            .result
+            .as_ref()
+            .and_then(|r| r.rows.get(row_idx))
+            .and_then(|row| row.get(col_idx))
+            .cloned()
+            .unwrap_or_default();
+        self.query.edit = EditDialog {
+            open: true,
+            row_idx,
+            col_idx,
+            schema: schema.to_owned(),
+            table: table.to_owned(),
+            column: column.to_owned(),
+            column_type: column_type.to_owned(),
+            nullable,
+            identity,
+            value: current,
+            saving: false,
+            error: None,
+            detail_expanded: false,
+            promise: None,
+        };
+    }
+
+    pub fn close_edit_cell(&mut self) {
+        self.query.edit.promise = None; // drop the pending update, if any
+        self.query.edit.open = false;
+        self.query.edit.saving = false;
+        self.query.edit.error = None;
+    }
+
+    /// Dispatch the UPDATE for the dialog's current value and remember the
+    /// task; the result is applied by [`Self::poll_edit`].
+    pub fn save_edit_cell(&mut self) {
+        let e = &self.query.edit;
+        if e.saving {
+            return;
+        }
+        let Some(pool) = self.query_pool() else {
+            self.query.edit.error = Some(crate::db::QueryError {
+                headline: "No active connection".into(),
+                detail: "The connection pool is gone; reconnect and try again.".into(),
+            });
+            return;
+        };
+        let value = e.value.clone();
+        let schema = e.schema.clone();
+        let table = e.table.clone();
+        let column = e.column.clone();
+        let identity = e.identity.clone();
+
+        self.query.edit.saving = true;
+        self.query.edit.error = None;
+        self.query.edit.promise = Some(Promise::spawn_async(async move {
+            crate::db::execute_cell_update(&pool, &schema, &table, &column, &value, &identity).await
+        }));
+    }
+
+    /// Poll the in-flight cell edit. On success, closes the dialog and
+    /// refreshes the current page so the grid shows the new value; on failure
+    /// the structured error lands in the dialog's error slot. Returns true
+    /// when the UI should repaint.
+    pub fn poll_edit(&mut self) -> bool {
+        if !self.query.edit.open {
+            return false;
+        }
+        let Some(promise) = self.query.edit.promise.take() else {
+            return false;
+        };
+        match promise.ready() {
+            None => {
+                self.query.edit.promise = Some(promise);
+                false
+            }
+            Some(Ok(rows)) => {
+                if *rows == 1 {
+                    let note = format!(
+                        "Updated {}.{}.{}",
+                        self.query.edit.schema, self.query.edit.table, self.query.edit.column
+                    );
+                    self.query.edit.open = false;
+                    self.query.edit.saving = false;
+                    self.query.copy_feedback = Some(CopyFeedback {
+                        text: note,
+                        since: std::time::Instant::now(),
+                    });
+                    // Reload the page so the grid reflects the change.
+                    let page = self.query.current_page;
+                    self.goto_page(page);
+                    true
+                } else {
+                    self.query.edit.saving = false;
+                    self.query.edit.error = Some(crate::db::QueryError {
+                        headline: format!("{rows} rows changed \u{2014} expected exactly 1"),
+                        detail: "The row may have been modified or deleted after it was \
+                                 loaded. Reload the results and try again."
+                            .into(),
+                    });
+                    true
+                }
+            }
+            Some(Err(e)) => {
+                self.query.edit.saving = false;
+                self.query.edit.error = Some(crate::db::QueryError::from_anyhow(&e));
+                true
+            }
         }
     }
 

@@ -1,6 +1,13 @@
 use crate::ui::theme::Theme;
 
-pub fn show(ui: &mut egui::Ui, filter_text: &mut String, theme: &Theme) {
+/// Transient success/notification line shown on the right of the filter bar
+/// (e.g. "Copied …from col"). `None` renders nothing.
+pub fn show(
+    ui: &mut egui::Ui,
+    filter_text: &mut String,
+    theme: &Theme,
+    feedback: Option<&str>,
+) {
     ui.horizontal(|ui| {
         ui.label(
             egui::RichText::new("Filter:")
@@ -28,6 +35,22 @@ pub fn show(ui: &mut egui::Ui, filter_text: &mut String, theme: &Theme) {
             {
                 filter_text.clear();
             }
+        }
+
+        // "Copied …" chip pinned to the right edge of the bar.
+        if let Some(text) = feedback {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} {}",
+                        egui_phosphor::regular::CHECK_CIRCLE,
+                        text
+                    ))
+                    .color(theme.success)
+                    .size(11.5),
+                );
+            });
         }
     });
     ui.separator();

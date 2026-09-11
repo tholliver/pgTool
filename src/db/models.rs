@@ -33,6 +33,9 @@ pub struct ColumnInfo {
 #[derive(Debug, Clone)]
 pub struct QueryResult {
     pub columns: Vec<String>,
+    /// Column type names (PostgreSQL `PgTypeInfo::name()`, e.g. "INT4",
+    /// "TEXT", "TIMESTAMPTZ"). Parallel to `columns`.
+    pub column_types: Vec<String>,
     pub rows: Vec<Vec<String>>,
     pub rows_affected: u64,
 }

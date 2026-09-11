@@ -303,6 +303,9 @@ fn draw_sql_editor(ui: &mut egui::Ui, state: &mut AppState, theme: &Theme) {
 
     ui.add_space(6.0);
     error_strip::draw(ui, state, theme);
+
+    // cell-edit dialog (modal on top of everything, like the others)
+    results::edit_dialog::show(ui.ctx(), state, theme);
 }
 
 /// Custom window titlebar: app icon, drag-to-move, double-click to
