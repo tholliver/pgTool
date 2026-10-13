@@ -97,7 +97,11 @@ impl eframe::App for App {
         // `query.pending_caret`.
         ctx.input_mut(|i| {
             // Only Alt+Enter (or F5) executes; a bare Enter is left alone
-            // so the SQL editor can insert a normal newline.
+            // so the SQL editor can insert a normal newline. Shift+F5 runs
+            // EXPLAIN (consumed first so it never also triggers a plain run).
+            if i.consume_key(egui::Modifiers::SHIFT, egui::Key::F5) {
+                self.state.explain_query(self.state.query.explain_analyze);
+            }
             let run = i.consume_key(egui::Modifiers::ALT, egui::Key::Enter)
                 || i.key_pressed(egui::Key::F5);
             if run {

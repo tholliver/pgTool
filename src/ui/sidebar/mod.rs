@@ -467,6 +467,12 @@ fn render_schemas_for(
                         let is_selected = is_current_db
                             && state.query.schema_idx == si
                             && state.query.table_idx == ti;
+                        let schema_name = schema.name.clone();
+                        let table_name = table.name.clone();
+                        let detail_key =
+                            (db_name.map(str::to_owned), schema_name, table_name);
+                        let is_detail_expanded =
+                            state.query.expanded_tables.contains(&detail_key);
 
                         // 1. reserve the row's space, 2. ask for interaction,
                         // 3. NOW we know hover/selection and can paint the bg.
@@ -503,6 +509,30 @@ fn render_schemas_for(
                         let painter = ui.painter_at(rect);
                         let left = rect.left() + 6.0;
                         let mid_y = rect.center().y;
+
+                        // Expander caret occupies the left gutter slot; the
+                        // table glyph stays where it was.
+                        let caret_rect = egui::Rect::from_min_max(
+                            egui::pos2(rect.left() + 1.0, rect.top()),
+                            egui::pos2(rect.left() + 15.0, rect.bottom()),
+                        );
+                        let caret_resp = ui.interact(
+                            caret_rect,
+                            egui::Id::new(("table_caret", db_name, si, ti)),
+                            egui::Sense::click(),
+                        );
+                        let caret_glyph = if is_detail_expanded {
+                            egui_phosphor::regular::CARET_DOWN
+                        } else {
+                            egui_phosphor::regular::CARET_RIGHT
+                        };
+                        painter.text(
+                            egui::pos2(caret_rect.center().x, mid_y),
+                            egui::Align2::CENTER_CENTER,
+                            caret_glyph,
+                            font_id.clone(),
+                            theme.text_muted,
+                        );
 
                         painter.text(
                             egui::pos2(left + 7.0, mid_y),
@@ -561,10 +591,28 @@ fn render_schemas_for(
                             );
                         }
 
-                        if resp.double_clicked() {
+                        // Caret toggles the lazy detail sub-list (indexes / fks /
+                        // triggers); clicking elsewhere selects the table.
+                        if caret_resp.clicked() {
+                            if is_detail_expanded {
+                                state.query.expanded_tables.remove(&detail_key);
+                            } else {
+                                state.query.expanded_tables.insert(detail_key.clone());
+                            }
+                        } else if resp.double_clicked() {
                             double_clicked = Some((si, ti));
                         } else if resp.clicked() {
                             clicked = Some((si, ti));
+                        }
+
+                        // When expanded, request the detail load lazily and
+                        // render the sub-list once it arrives.
+                        if is_detail_expanded {
+                            state.start_load_table_details(db_name, &schema.name, &table.name);
+                            ui.indent(
+                                egui::Id::new(("table_detail_indent", db_name, si, ti)),
+                                |ui| render_table_details(ui, theme, table),
+                            );
                         }
                     }
                 }
@@ -588,5 +636,87 @@ fn render_schemas_for(
         } else {
             state.select_table(si, ti);
         }
+    }
+}
+
+/// Lazy per-table detail sub-list rendered under an expanded table node:
+/// indexes, foreign keys, and triggers. Shows a brief loading line until the
+/// detail promise resolves into the `TableInfo`.
+fn render_table_details(ui: &mut egui::Ui, theme: &Theme, table: &crate::db::TableInfo) {
+    if !table.detail_loaded {
+        ui.label(
+            egui::RichText::new("Loading details...")
+                .color(theme.text_muted)
+                .size(12.0),
+        );
+        return;
+    }
+
+    if !table.indexes.is_empty() {
+        ui.label(
+            egui::RichText::new("Indexes")
+                .color(theme.text)
+                .monospace()
+                .size(12.0)
+                .strong(),
+        );
+        for idx in &table.indexes {
+            let tag = if idx.is_unique { " UNIQUE" } else { "" };
+            ui.label(
+                egui::RichText::new(format!("  {} ({}){}", idx.name, idx.columns.join(", "), tag))
+                    .color(theme.text)
+                    .monospace()
+                    .size(11.5),
+            );
+        }
+    }
+
+    if !table.foreign_keys.is_empty() {
+        ui.label(
+            egui::RichText::new("Foreign keys")
+                .color(theme.text)
+                .monospace()
+                .size(12.0)
+                .strong(),
+        );
+        for fk in &table.foreign_keys {
+            ui.label(
+                egui::RichText::new(format!(
+                    "  {} ({} -> {})",
+                    fk.name,
+                    fk.columns.join(", "),
+                    fk.ref_table
+                ))
+                .color(theme.text)
+                .monospace()
+                .size(11.5),
+            );
+        }
+    }
+
+    if !table.triggers.is_empty() {
+        ui.label(
+            egui::RichText::new("Triggers")
+                .color(theme.text)
+                .monospace()
+                .size(12.0)
+                .strong(),
+        );
+        for tr in &table.triggers {
+            ui.label(
+                egui::RichText::new(format!("  {} ({}, {})", tr.name, tr.timing, tr.event))
+                    .color(theme.text)
+                    .monospace()
+                    .size(11.5),
+            );
+        }
+    }
+
+    if table.indexes.is_empty() && table.foreign_keys.is_empty() && table.triggers.is_empty() {
+        ui.label(
+            egui::RichText::new("No indexes, foreign keys, or triggers")
+                .color(theme.text_muted)
+                .size(11.5),
+        );
     }
 }

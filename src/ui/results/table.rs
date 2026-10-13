@@ -38,7 +38,7 @@ pub struct EditableSheet {
 
 impl EditableSheet {
     fn column_eligible(&self, ci: usize) -> bool {
-        self.columns.get(ci).is_some_and(Option::is_some) as bool
+        self.columns.get(ci).is_some_and(Option::is_some)
     }
 
     /// A row is a safe UPDATE target only when every PK column is present in
@@ -57,6 +57,8 @@ pub enum TableEvent {
     /// The user asked to edit a cell (`row_idx` is the index into the
     /// original result rows, stable across client-side filtering).
     Edit { row_idx: usize, col_idx: usize },
+    /// The user asked to edit a whole row in the row dialog.
+    EditRow { row_idx: usize },
 }
 
 /// Draws the results table.
@@ -65,6 +67,7 @@ pub enum TableEvent {
 /// selection and keyboard navigation work on visible order, while edit events
 /// carry the underlying row index. Returns the event for this frame (copy or
 /// requested edit), if any.
+#[allow(clippy::too_many_arguments)]
 pub fn show(
     ui: &mut egui::Ui,
     cols: &[String],
@@ -102,8 +105,8 @@ pub fn show(
                 .striped(false)
                 .cell_layout(egui::Layout::left_to_right(egui::Align::Center));
 
-            for ci in 0..n_cols {
-                tb = tb.column(if is_int[ci] {
+            for is_int in is_int.iter() {
+                tb = tb.column(if *is_int {
                     Column::initial(INT_COL_W)
                         .range(48.0..=160.0)
                         .resizable(true)
@@ -218,6 +221,52 @@ pub fn show(
                                 }
                                 ui.separator();
 
+                                // Whole-row editing: offered on the same
+                                // conditions as cell editing (plain single
+                                // table select with a usable PK).
+                                let row_eligible = edit.is_some_and(|e| e.row_eligible(data_row));
+                                if row_eligible {
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                egui::RichText::new(format!(
+                                                    "{} Edit row\u{2026}",
+                                                    egui_phosphor::regular::PENCIL_SIMPLE
+                                                ))
+                                                .color(theme.text),
+                                            )
+                                            .min_size(egui::vec2(180.0, 24.0)),
+                                        )
+                                        .clicked()
+                                    {
+                                        event = Some(TableEvent::EditRow { row_idx });
+                                        ui.close();
+                                    }
+                                } else {
+                                    let reason = match edit {
+                                        None => {
+                                            "Editing needs a plain single-table select \
+                                                 with a primary key in the result."
+                                        }
+                                        Some(_) => {
+                                            "This row has a NULL primary key and cannot be \
+                                             targeted safely."
+                                        }
+                                    };
+                                    ui.add_enabled(
+                                        false,
+                                        egui::Button::new(
+                                            egui::RichText::new(format!(
+                                                "{} Edit row\u{2026}",
+                                                egui_phosphor::regular::PENCIL_SIMPLE
+                                            ))
+                                            .color(theme.text_muted),
+                                        )
+                                        .min_size(egui::vec2(180.0, 24.0)),
+                                    )
+                                    .on_disabled_hover_text(reason);
+                                }
+
                                 let eligible = edit.is_some_and(|e| {
                                     e.column_eligible(ci) && e.row_eligible(data_row)
                                 });
@@ -282,16 +331,14 @@ pub fn show(
     if event.is_none()
         && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::C))
         && !editor_has_focus
+        && let Some((r, c)) = *selected
+        && let Some(cell) = rows.get(r).and_then(|(_, row)| row.get(c))
     {
-        if let Some((r, c)) = *selected
-            && let Some(cell) = rows.get(r).and_then(|(_, row)| row.get(c))
-        {
-            ui.ctx().copy_text(cell.clone());
-            event = Some(TableEvent::Copy {
-                column: cols[c].clone(),
-                value: cell.clone(),
-            });
-        }
+        ui.ctx().copy_text(cell.clone());
+        event = Some(TableEvent::Copy {
+            column: cols[c].clone(),
+            value: cell.clone(),
+        });
     }
 
     event

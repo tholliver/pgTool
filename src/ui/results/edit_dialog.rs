@@ -1,4 +1,5 @@
 use crate::app::state::AppState;
+use crate::ui::results::dialog::{chip, error_strip};
 use crate::ui::theme::Theme;
 
 /// Keys held by the dialog while the show() closure and the surrounding
@@ -24,7 +25,7 @@ pub fn show(ctx: &egui::Context, state: &mut AppState, theme: &Theme) {
 
     // dim backdrop
     egui::Area::new(egui::Id::new("edit_dialog_backdrop"))
-        .order(egui::Order::Foreground)
+        .order(egui::Order::Middle)
         .show(ctx, |ui| {
             let screen = ui.input(|i| i.viewport_rect());
             ui.painter().rect_filled(
@@ -111,7 +112,7 @@ pub fn show(ctx: &egui::Context, state: &mut AppState, theme: &Theme) {
             ui.add_space(10.0);
 
             if let Some(err) = d.error.clone() {
-                error_strip(ui, d, theme, &err);
+                error_strip(ui, theme, &err, &mut d.detail_expanded);
                 ui.add_space(8.0);
             }
 
@@ -150,102 +151,4 @@ pub fn show(ctx: &egui::Context, state: &mut AppState, theme: &Theme) {
     } else if pending.save {
         state.save_edit_cell();
     }
-}
-
-/// Small colored capsule for the column / type / nullability badges.
-fn chip(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
-    egui::Frame::new()
-        .fill(color.gamma_multiply(0.18))
-        .corner_radius(9)
-        .inner_margin(egui::Margin::symmetric(8, 3))
-        .show(ui, |ui| {
-            ui.label(
-                egui::RichText::new(text)
-                    .monospace()
-                    .size(11.0)
-                    .color(color),
-            );
-        });
-}
-
-/// Compact inline error for the dialog: danger headline with an expandable
-/// detail block, matching the query error strip's look but self-contained.
-fn error_strip(
-    ui: &mut egui::Ui,
-    d: &mut crate::app::state::EditDialog,
-    theme: &Theme,
-    error: &crate::db::QueryError,
-) {
-    egui::Frame::new()
-        .fill(theme.surface)
-        .corner_radius(6)
-        .inner_margin(egui::Margin::symmetric(8, 6))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new(egui_phosphor::regular::X_CIRCLE)
-                        .color(theme.danger)
-                        .size(14.0),
-                );
-                ui.label(
-                    egui::RichText::new(&error.headline)
-                        .color(theme.text)
-                        .size(12.0)
-                        .strong(),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let (label, icon) = if d.detail_expanded {
-                        ("Hide", egui_phosphor::regular::CARET_UP)
-                    } else {
-                        ("Details", egui_phosphor::regular::CARET_DOWN)
-                    };
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                egui::RichText::new(format!("{label} {icon}"))
-                                    .color(theme.accent)
-                                    .size(11.0),
-                            )
-                            .fill(egui::Color32::TRANSPARENT),
-                        )
-                        .clicked()
-                    {
-                        d.detail_expanded = !d.detail_expanded;
-                    }
-                });
-            });
-            if d.detail_expanded {
-                ui.add_space(4.0);
-                egui::ScrollArea::vertical()
-                    .max_height(110.0)
-                    .id_salt("edit_error_detail_scroll")
-                    .show(ui, |ui| {
-                        ui.set_min_width(ui.available_width());
-                        ui.label(
-                            egui::RichText::new(&error.detail)
-                                .monospace()
-                                .size(11.5)
-                                .color(theme.danger.gamma_multiply(0.85)),
-                        );
-                    });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                egui::RichText::new(format!(
-                                    "{} Copy error",
-                                    egui_phosphor::regular::COPY
-                                ))
-                                .color(theme.text_muted)
-                                .size(10.5),
-                            )
-                            .fill(egui::Color32::TRANSPARENT),
-                        )
-                        .clicked()
-                    {
-                        ui.ctx().copy_text(error.detail.clone());
-                    }
-                });
-            }
-        });
 }

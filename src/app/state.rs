@@ -30,6 +30,11 @@ pub struct Candidate {
 /// resolves to (pool, schemas) for the keyed database name.
 type DbSchemaPromise = Promise<anyhow::Result<(PgPool, Vec<db::SchemaInfo>)>>;
 
+/// One in-flight lazy table-detail load: `(database, schema, table, promise)`.
+/// `database` is `None` in single-database mode, and the promise resolves to
+/// the table's indexes/foreign-keys/triggers.
+type TableDetailPromise = Promise<anyhow::Result<db::TableDetails>>;
+
 pub struct ConnectionState {
     pub profiles: Vec<ConnectionProfile>,
     pub active_id: Option<String>,
@@ -229,6 +234,22 @@ pub struct QueryState {
     pub last_error: Option<crate::db::QueryError>,
     /// Whether the error panel's full-detail view is open.
     pub error_detail_expanded: bool,
+    /// Whether EXPLAIN runs with `ANALYZE` (executes the statement for real
+    /// timings); off by default and refused for data-modifying statements.
+    pub explain_analyze: bool,
+    /// Plan render format: pretty (indented JSON, default) vs raw
+    /// (byte-for-byte as Postgres returned it).
+    pub explain_pretty: bool,
+    /// The last successful EXPLAIN result; `None` hides the plan panel.
+    pub explain_result: Option<db::ExplainResult>,
+    /// Whether the plan panel is expanded (collapsed shows its header row).
+    pub explain_panel_open: bool,
+    /// In-flight EXPLAIN task: resolves to `(plan, analyze)`. It reuses the
+    /// dispatch/duration bookkeeping of normal queries but lands in
+    /// `explain_result` instead of `result`.
+    pub explain_promise: Option<Promise<anyhow::Result<(String, bool)>>>,
+    /// Abort handle for the running EXPLAIN task (cancellation).
+    pub explain_cancel: Option<tokio::task::AbortHandle>,
     /// Results grid selection `(row, column)` (0-based, into the rows as
     /// displayed this frame). Currently drives copy; reserved as the anchor
     /// for cell editing in a later release.
@@ -237,6 +258,19 @@ pub struct QueryState {
     pub copy_feedback: Option<CopyFeedback>,
     /// Modal cell-edit dialog (opened from the results grid context menu).
     pub edit: EditDialog,
+    /// Modal full-row edit dialog (opened from the results grid context menu).
+    pub row_edit: RowEditDialog,
+    /// Installed extensions of the connected database (single-db mode).
+    pub extensions: Vec<db::ExtensionInfo>,
+    pub extension_promise: Option<Promise<anyhow::Result<Vec<db::ExtensionInfo>>>>,
+    /// `(database, schema, table)` triples whose detail sub-list is expanded
+    /// in the tree. `database` is `None` in single-database mode, so the same
+    /// schema/table name across two databases in browse-all mode stays
+    /// distinct (and its details load from the right pool).
+    pub expanded_tables: std::collections::HashSet<(Option<String>, String, String)>,
+    /// Lazy per-table detail load (indexes / fks / triggers), triggered by
+    /// expanding a table node.
+    pub table_detail_promise: Option<(Option<String>, String, String, TableDetailPromise)>,
 }
 
 /// Short-lived notification that a cell value was copied to the clipboard;
@@ -297,6 +331,44 @@ impl Default for EditDialog {
     }
 }
 
+/// One editable column in the full-row dialog. `dirty` only becomes true when
+/// the user actually changed the value; only dirty fields make it into the
+/// generated UPDATE's SET clause.
+pub struct RowEditField {
+    pub column: String,
+    pub column_type: String,
+    pub nullable: bool,
+    pub original_value: String,
+    pub value: String,
+    pub dirty: bool,
+}
+
+/// Modal "Edit row" dialog state (results grid right-click → Edit row).
+/// Like [`EditDialog`], it is only offered when the result set is a plain
+/// projection of the selected table with a primary key in the result, so the
+/// generated UPDATE always targets exactly one row.
+#[derive(Default)]
+pub struct RowEditDialog {
+    pub open: bool,
+    /// Row index into the current result set (stable across client-side
+    /// filtering).
+    pub row_idx: usize,
+    pub schema: String,
+    pub table: String,
+    /// `(primary-key column, value)` pairs used to build the WHERE clause.
+    /// Shown read-only under "Row identity"; never editable.
+    pub identity: Vec<(String, String)>,
+    /// Non-PK result columns, one entry per editable field.
+    pub fields: Vec<RowEditField>,
+    /// True while the UPDATE is in flight (Save disabled).
+    pub saving: bool,
+    /// Structured failure from the last save attempt.
+    pub error: Option<crate::db::QueryError>,
+    /// Whether the dialog's error detail panel is expanded.
+    pub detail_expanded: bool,
+    pub promise: Option<Promise<anyhow::Result<u64>>>,
+}
+
 impl Default for QueryState {
     fn default() -> Self {
         Self {
@@ -339,9 +411,20 @@ impl Default for QueryState {
             session_failed_count: 0,
             last_error: None,
             error_detail_expanded: false,
+            explain_analyze: false,
+            explain_pretty: true,
+            explain_result: None,
+            explain_panel_open: true,
+            explain_promise: None,
+            explain_cancel: None,
             selected_cell: None,
             copy_feedback: None,
             edit: EditDialog::default(),
+            row_edit: RowEditDialog::default(),
+            extensions: Vec::new(),
+            extension_promise: None,
+            expanded_tables: std::collections::HashSet::new(),
+            table_detail_promise: None,
         }
     }
 }
@@ -541,6 +624,10 @@ impl AppState {
         self.query.schemas.clear();
         self.query.databases.clear();
         self.query.expanded_databases.clear();
+        self.query.extensions.clear();
+        self.query.extension_promise = None;
+        self.query.expanded_tables.clear();
+        self.query.table_detail_promise = None;
         self.query.active_database = None;
         self.query.schema_idx = 0;
         self.query.table_idx = 0;
@@ -563,6 +650,10 @@ impl AppState {
         self.query.last_error = None;
         self.query.error_detail_expanded = false;
         self.query.last_run_started_at = None;
+        self.query.explain_result = None;
+        self.query.explain_panel_open = true;
+        self.query.explain_promise = None;
+        self.query.explain_cancel = None;
     }
 
     pub fn poll_promises(&mut self) -> bool {
@@ -673,6 +764,10 @@ impl AppState {
             }
             self.update_sql();
             self.query.status = format!("{name} — schemas loaded");
+            // Extensions are database-level; load them for this database too.
+            if let Some(pool) = self.query.database_pools.get(&name).cloned() {
+                self.spawn_extension_load(pool);
+            }
             changed = true;
         }
 
@@ -686,11 +781,53 @@ impl AppState {
                     self.update_sql();
                     self.query.status =
                         format!("Connected — {} schema(s) loaded", self.query.schemas.len());
+                    if let Some(pool) = self.query_pool() {
+                        self.spawn_extension_load(pool);
+                    }
                     changed = true;
                 }
                 Some(Err(e)) => {
                     self.query.status = format!("Schema load error: {e}");
                     self.query.schema_promise = None;
+                    changed = true;
+                }
+            }
+        }
+
+        // Poll extension promise
+        if let Some(p) = &self.query.extension_promise {
+            match p.ready() {
+                None => {}
+                Some(Ok(extensions)) => {
+                    self.query.extensions = extensions.clone();
+                    self.query.extension_promise = None;
+                    changed = true;
+                }
+                Some(Err(e)) => {
+                    self.query.status = format!("Extension load error: {e}");
+                    self.query.extension_promise = None;
+                    changed = true;
+                }
+            }
+        }
+
+        // Poll per-table detail promise (lazy indexes / fks / triggers).
+        if let Some((db, schema, table, p)) = self.query.table_detail_promise.take() {
+            match p.ready() {
+                None => {
+                    self.query.table_detail_promise = Some((db, schema, table, p));
+                }
+                Some(Ok(details)) => {
+                    if let Some(t) = self.find_table_mut(db.as_deref(), &schema, &table) {
+                        t.indexes = details.indexes.clone();
+                        t.foreign_keys = details.foreign_keys.clone();
+                        t.triggers = details.triggers.clone();
+                        t.detail_loaded = true;
+                    }
+                    changed = true;
+                }
+                Some(Err(e)) => {
+                    self.query.status = format!("Failed to load {schema}.{table} details: {e}");
                     changed = true;
                 }
             }
@@ -729,6 +866,42 @@ impl AppState {
             }
         }
 
+        // Poll EXPLAIN promise (shares the normal query's dispatch bookkeeping).
+        if let Some(p) = self.query.explain_promise.take() {
+            match p.ready() {
+                None => {
+                    self.query.explain_promise = Some(p);
+                }
+                Some(Ok((plan, analyze))) => {
+                    self.query.explain_cancel = None;
+                    self.query.record_query_success();
+                    let elapsed_ms = self
+                        .query
+                        .last_run_duration
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    self.query.explain_result = Some(db::ExplainResult {
+                        plan: plan.clone(),
+                        analyze: *analyze,
+                        elapsed_ms,
+                    });
+                    self.query.explain_panel_open = true;
+                    self.query.status = if *analyze {
+                        format!("EXPLAIN ANALYZE complete \u{2014} {elapsed_ms} ms")
+                    } else {
+                        format!("EXPLAIN complete \u{2014} {elapsed_ms} ms")
+                    };
+                    changed = true;
+                }
+                Some(Err(e)) => {
+                    self.query.explain_cancel = None;
+                    self.query.record_query_failure(e);
+                    self.query.status = format!("EXPLAIN error: {e}");
+                    changed = true;
+                }
+            }
+        }
+
         changed
     }
 
@@ -738,6 +911,79 @@ impl AppState {
             || self.query.database_promise.is_some()
             || self.query.db_schema_promise.is_some()
             || self.query.query_promise.is_some()
+            || self.query.explain_promise.is_some()
+    }
+
+    /// Kick off the database-level extension list for a connected pool.
+    fn spawn_extension_load(&mut self, pool: PgPool) {
+        self.query.extension_promise = Some(Promise::spawn_async(async move {
+            db::load_extensions(&pool).await
+        }));
+    }
+
+    /// Find a table by qualified name. `db` is `Some` when browsing multiple
+    /// databases and scopes the search (plus the detail pool) to that
+    /// database's tree.
+    fn find_table_mut(
+        &mut self,
+        db: Option<&str>,
+        schema: &str,
+        table: &str,
+    ) -> Option<&mut db::TableInfo> {
+        if let Some(db) = db {
+            return self
+                .query
+                .databases
+                .iter_mut()
+                .find(|d| d.name == db)
+                .and_then(|d| {
+                    d.schemas
+                        .iter_mut()
+                        .flat_map(|s| s.tables.iter_mut())
+                        .find(|t| t.schema == schema && t.name == table)
+                });
+        }
+        self.query
+            .schemas
+            .iter_mut()
+            .flat_map(|s| s.tables.iter_mut())
+            .find(|t| t.schema == schema && t.name == table)
+    }
+
+    /// Lazily fetch indexes / foreign keys / triggers for a table, triggered
+    /// by expanding its node in the schema tree. No-op when already loaded or
+    /// when a load is already in flight for that table.
+    pub fn start_load_table_details(&mut self, db: Option<&str>, schema: &str, table: &str) {
+        if self.find_table_mut(db, schema, table).is_some_and(|t| t.detail_loaded) {
+            return;
+        }
+        if let Some((d, s, t, _)) = &self.query.table_detail_promise
+            && d.as_deref() == db
+            && s == schema
+            && t == table
+        {
+            return;
+        }
+        let pool = match db {
+            Some(name) => match self.query.database_pools.get(name) {
+                Some(pool) => pool.clone(),
+                None => return,
+            },
+            None => match self.connection.active_pool {
+                Some(ref pool) => pool.clone(),
+                None => return,
+            },
+        };
+        let schema = schema.to_string();
+        let table = table.to_string();
+        self.query.table_detail_promise = Some((
+            db.map(str::to_owned),
+            schema.clone(),
+            table.clone(),
+            Promise::spawn_async(async move {
+                db::load_table_details(&pool, &schema, &table).await
+            }),
+        ));
     }
 
     /// The pool queries should currently run against: the per-database pool
@@ -778,6 +1024,45 @@ impl AppState {
         self.execute_current_query();
     }
 
+    /// Dispatch `EXPLAIN` for the current SQL. ANALYZE is refused for
+    /// data-modifying statements up front: EXPLAIN ANALYZE genuinely executes
+    /// them, so its effects would be written to the database.
+    pub fn explain_query(&mut self, analyze: bool) {
+        if self.query.sql.trim().is_empty() {
+            return;
+        }
+        if analyze && Self::is_destructive(&self.query.sql) {
+            self.query.status = "EXPLAIN ANALYZE is not available for data-modifying \
+                                 statements \u{2014} ANALYZE would execute them for real."
+                .into();
+            return;
+        }
+        let Some(pool) = self.query_pool() else {
+            if self.browse_all_active() {
+                self.query.status = "Expand a database and pick a table first".into();
+            }
+            return;
+        };
+        self.query.explain_analyze = analyze;
+        let sql = self.query.sql.clone();
+        self.query.record_query_dispatch();
+        self.query.status = if analyze {
+            "Running EXPLAIN ANALYZE...".into()
+        } else {
+            "Running EXPLAIN...".into()
+        };
+        let handle = self
+            .rt
+            .spawn(async move { db::execute_explain(&pool, &sql, analyze).await.map(|p| (p, analyze)) });
+        self.query.explain_cancel = Some(handle.abort_handle());
+        self.query.explain_promise = Some(Promise::spawn_async(async move {
+            match handle.await {
+                Ok(res) => res,
+                Err(_) => Err(anyhow::anyhow!("explain was cancelled")),
+            }
+        }));
+    }
+
     /// Starts with a data-modifying keyword? (Plain prefix check on the
     /// trimmed, uppercased statement — CTEs/comments are not handled.)
     fn is_destructive(sql: &str) -> bool {
@@ -798,8 +1083,6 @@ impl AppState {
                 // A fresh query always starts at the first page.
                 self.query.current_page = 0;
                 self.query.has_next_page = false;
-                // Snap the editor/results split back to 50/50 on every fresh run.
-                self.query.results_split_ratio = 0.5;
                 let handle = self
                     .rt
                     .spawn(async move { db::execute_query(&pool, &sql).await });
@@ -858,6 +1141,7 @@ impl AppState {
     /// Open the cell-edit dialog for a result cell. `identity` is the
     /// `(primary-key column, value)` set that unambiguously locates the row;
     /// the cell's current value seeds the value box.
+    #[allow(clippy::too_many_arguments)]
     pub fn open_edit_cell(
         &mut self,
         row_idx: usize,
@@ -974,7 +1258,162 @@ impl AppState {
             }
             Some(Err(e)) => {
                 self.query.edit.saving = false;
-                self.query.edit.error = Some(crate::db::QueryError::from_anyhow(&e));
+                self.query.edit.error = Some(crate::db::QueryError::from_anyhow(e));
+                true
+            }
+        }
+    }
+
+    /// Open the full-row edit dialog for a result row. Every non-PK result
+    /// column that maps onto the selected table becomes an editable field
+    /// (seeded with the row's current value); PK columns are captured as the
+    /// read-only row identity used for the WHERE clause.
+    pub fn open_edit_row(&mut self, row_idx: usize) {
+        let Some(result) = self.query.result.as_ref() else {
+            return;
+        };
+        let Some(table) = self.selected_table() else {
+            return;
+        };
+        let Some(row) = result.rows.get(row_idx) else {
+            return;
+        };
+
+        let mut identity: Vec<(String, String)> = Vec::new();
+        let mut fields: Vec<RowEditField> = Vec::new();
+
+        for (ci, name) in result.columns.iter().enumerate() {
+            let Some(col) = table.columns.iter().find(|c| &c.name == name) else {
+                // Not a plain projection of the selected table — abort
+                // instead of producing a half-valid dialog.
+                return;
+            };
+            let value = row.get(ci).cloned().unwrap_or_default();
+            if col.is_pk {
+                identity.push((name.clone(), value));
+            } else {
+                fields.push(RowEditField {
+                    column: name.clone(),
+                    column_type: result
+                        .column_types
+                        .get(ci)
+                        .cloned()
+                        .unwrap_or_default(),
+                    nullable: col.nullable,
+                    original_value: value.clone(),
+                    value,
+                    dirty: false,
+                });
+            }
+        }
+
+        if identity.is_empty() {
+            return; // no usable PK — cannot build a safe WHERE
+        }
+
+        self.query.row_edit = RowEditDialog {
+            open: true,
+            row_idx,
+            schema: table.schema.clone(),
+            table: table.name.clone(),
+            identity,
+            fields,
+            saving: false,
+            error: None,
+            detail_expanded: false,
+            promise: None,
+        };
+    }
+
+    pub fn close_edit_row(&mut self) {
+        self.query.row_edit.promise = None; // drop the pending update, if any
+        self.query.row_edit.open = false;
+        self.query.row_edit.saving = false;
+        self.query.row_edit.error = None;
+    }
+
+    /// Dispatch the dirty-only UPDATE for the dialog's current fields and
+    /// remember the task; the result is applied by [`Self::poll_edit_row`].
+    /// With nothing changed it just closes (a no-op save).
+    pub fn save_edit_row(&mut self) {
+        let d = &self.query.row_edit;
+        if d.saving || !d.open {
+            return;
+        }
+        let updates: Vec<(String, String)> = d
+            .fields
+            .iter()
+            .filter(|f| f.dirty)
+            .map(|f| (f.column.clone(), f.value.clone()))
+            .collect();
+        if updates.is_empty() {
+            self.close_edit_row();
+            return;
+        }
+        let Some(pool) = self.query_pool() else {
+            self.query.row_edit.error = Some(crate::db::QueryError {
+                headline: "No active connection".into(),
+                detail: "The connection pool is gone; reconnect and try again.".into(),
+            });
+            return;
+        };
+        let schema = d.schema.clone();
+        let table = d.table.clone();
+        let identity = d.identity.clone();
+
+        self.query.row_edit.saving = true;
+        self.query.row_edit.error = None;
+        self.query.row_edit.promise = Some(Promise::spawn_async(async move {
+            crate::db::execute_row_update(&pool, &schema, &table, &updates, &identity).await
+        }));
+    }
+
+    /// Poll the in-flight row edit. On success, closes the dialog and
+    /// refreshes the current page so the grid shows the new values; on
+    /// failure the structured error lands in the dialog's error slot. Returns
+    /// true when the UI should repaint.
+    pub fn poll_edit_row(&mut self) -> bool {
+        if !self.query.row_edit.open {
+            return false;
+        }
+        let Some(promise) = self.query.row_edit.promise.take() else {
+            return false;
+        };
+        match promise.ready() {
+            None => {
+                self.query.row_edit.promise = Some(promise);
+                false
+            }
+            Some(Ok(rows)) => {
+                if *rows == 1 {
+                    let note = format!(
+                        "Updated {}.{}",
+                        self.query.row_edit.schema, self.query.row_edit.table
+                    );
+                    self.query.row_edit.open = false;
+                    self.query.row_edit.saving = false;
+                    self.query.copy_feedback = Some(CopyFeedback {
+                        text: note,
+                        since: std::time::Instant::now(),
+                    });
+                    // Reload the page so the grid reflects the change.
+                    let page = self.query.current_page;
+                    self.goto_page(page);
+                    true
+                } else {
+                    self.query.row_edit.saving = false;
+                    self.query.row_edit.error = Some(crate::db::QueryError {
+                        headline: format!("{rows} rows changed \u{2014} expected exactly 1"),
+                        detail: "The row may have been modified or deleted after it was \
+                                 loaded. Reload the results and try again."
+                            .into(),
+                    });
+                    true
+                }
+            }
+            Some(Err(e)) => {
+                self.query.row_edit.saving = false;
+                self.query.row_edit.error = Some(crate::db::QueryError::from_anyhow(e));
                 true
             }
         }

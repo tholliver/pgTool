@@ -14,17 +14,14 @@ pub fn show(
                 .color(theme.text_muted)
                 .size(12.0),
         );
-        let resp = ui.add(
+        ui.add(
             egui::TextEdit::singleline(filter_text)
                 .desired_width(200.0)
                 .hint_text("Search rows...")
                 .font(egui::TextStyle::Monospace),
         );
-        if resp.changed() {
-            // filter updates live — no action needed, next frame will re-filter
-        }
-        if !filter_text.is_empty() {
-            if ui
+        if !filter_text.is_empty()
+            && ui
                 .add(
                     egui::Button::new(egui::RichText::new("×").color(theme.text_muted).size(14.0))
                         .fill(egui::Color32::TRANSPARENT)
@@ -32,9 +29,8 @@ pub fn show(
                 )
                 .on_hover_text("Clear filter")
                 .clicked()
-            {
-                filter_text.clear();
-            }
+        {
+            filter_text.clear();
         }
 
         // "Copied …" chip pinned to the right edge of the bar.

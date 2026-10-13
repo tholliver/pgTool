@@ -9,7 +9,7 @@ pub fn show(ctx: &egui::Context, dialog: &mut ConnectionDialog, theme: &Theme) {
 
     // dim backdrop
     egui::Area::new(egui::Id::new("dialog_backdrop"))
-        .order(egui::Order::Foreground)
+        .order(egui::Order::Middle)
         .show(ctx, |ui| {
             let screen = ui.input(|i| i.viewport_rect());
             ui.painter().rect_filled(

@@ -103,6 +103,93 @@ pub async fn execute_cell_update(
     Ok(res.rows_affected() as u64)
 }
 
+/// Run `EXPLAIN (FORMAT JSON, ANALYZE ?) <sql>` and return the plan as a
+/// JSON-encoded string (Postgres emits a one-row, one-column result holding
+/// the serialized plan tree). Uses the same text-protocol streaming as
+/// [`execute_query`], so the JSON arrives exactly as Postgres formats it.
+///
+/// ANALYZE actually executes the statement — for data-modifying statements the
+/// caller refuses it up front so it can never write real data.
+pub async fn execute_explain(pool: &PgPool, sql: &str, analyze: bool) -> Result<String> {
+    let options = if analyze {
+        "FORMAT JSON, ANALYZE true, BUFFERS true, SUMMARY true"
+    } else {
+        "FORMAT JSON, ANALYZE false"
+    };
+    let explain_sql = format!("EXPLAIN ({options})\n{sql}");
+    let mut stream = sqlx::raw_sql(&explain_sql).fetch(pool);
+
+    let mut plan = String::new();
+    while let Some(row) = stream.try_next().await.context("explain failed")? {
+        let val = row.try_get_raw(0)?;
+        if !val.is_null() {
+            match val.as_str() {
+                Ok(s) => plan.push_str(s),
+                Err(_) => plan.push_str(&String::from_utf8_lossy(val.as_bytes().unwrap_or_default())),
+            }
+        }
+    }
+
+    if plan.trim().is_empty() {
+        anyhow::bail!("EXPLAIN returned no plan");
+    }
+    Ok(plan)
+}
+
+/// UPDATE several columns of one row in a single statement. Only the columns
+/// listed in `updates` appear in the SET clause; the row is targeted by
+/// equality on its primary key (the identity pairs). Values and PK values are
+/// bound as parameters, so Postgres infers types from context; identifiers
+/// come from the catalog. Returns rows affected.
+pub async fn execute_row_update(
+    pool: &PgPool,
+    schema: &str,
+    table: &str,
+    updates: &[(String, String)],
+    identity: &[(String, String)],
+) -> Result<u64> {
+    debug_assert!(
+        !identity.is_empty(),
+        "a single-row UPDATE needs a WHERE predicate"
+    );
+    debug_assert!(
+        !updates.is_empty(),
+        "an UPDATE needs at least one SET column"
+    );
+
+    let table_ident = format!("{}.{}", quote_ident(schema), quote_ident(table));
+    let set_clause = updates
+        .iter()
+        .enumerate()
+        .map(|(i, (col, _))| format!("{} = ${}", quote_ident(col), i + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let where_clause = identity
+        .iter()
+        .enumerate()
+        .map(|(i, (col, _))| {
+            format!(
+                "{} = ${}",
+                quote_ident(col),
+                i + 1 + updates.len()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let sql = format!("UPDATE {table_ident} SET {set_clause} WHERE {where_clause}");
+
+    let mut q = sqlx::query(&sql);
+    for (_, v) in updates {
+        q = q.bind(v);
+    }
+    for (_, v) in identity {
+        q = q.bind(v);
+    }
+
+    let res = q.execute(pool).await.context("row update failed")?;
+    Ok(res.rows_affected() as u64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,6 +250,44 @@ mod tests {
         assert_eq!(row[10], "hello world");
         assert_eq!(row[11], "", "empty string stays distinct from NULL");
         assert_eq!(row[12], "NULL");
+
+        pool.close().await;
+    }
+
+    /// Live smoke test for EXPLAIN (skips silently when DATABASE_URL is unset
+    /// or unreachable). The plan must decode as JSON and, with ANALYZE, be a
+    /// real (non-null) run.
+    #[tokio::test]
+    async fn explain_returns_parseable_json() {
+        dotenvy::dotenv().ok();
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+
+        let Ok(pool) = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+        else {
+            eprintln!("skipping: cannot reach database");
+            return;
+        };
+
+        let plan = execute_explain(&pool, "SELECT 42", false)
+            .await
+            .expect("plain EXPLAIN should succeed");
+        let value: serde_json::Value =
+            serde_json::from_str(&plan).expect("plain EXPLAIN yield must be JSON");
+
+        let analyzed = execute_explain(&pool, "SELECT 42", true)
+            .await
+            .expect("EXPLAIN ANALYZE should succeed");
+        serde_json::from_str::<serde_json::Value>(&analyzed).expect("ANALYZE plan must be JSON");
+        assert!(
+            !analyzed.is_empty() && value.is_array(),
+            "plan should be a JSON array"
+        );
 
         pool.close().await;
     }

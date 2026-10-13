@@ -1,5 +1,7 @@
+pub mod dialog;
 pub mod edit_dialog;
 pub mod pagination;
+pub mod row_edit_dialog;
 pub mod search_bar;
 pub mod table;
 
@@ -109,6 +111,7 @@ pub fn show_panel(ui: &mut egui::Ui, state: &mut AppState, theme: &Theme) {
 
         let mut action: Option<Action> = None;
         let mut edit_requests: Vec<EditRequest> = Vec::new();
+        let mut row_edit_requests: Vec<usize> = Vec::new();
 
         // Bottom-up layout: the pagination row is drawn FIRST, which pins
         // it to the very bottom edge of the panel at any size; the table
@@ -198,6 +201,12 @@ pub fn show_panel(ui: &mut egui::Ui, state: &mut AppState, theme: &Theme) {
                             });
                         }
                     }
+                    Some(TableEvent::EditRow { row_idx }) => {
+                        // No per-column data needed — open_edit_row rebuilds
+                        // everything from state, so only the stable row index
+                        // is forwarded.
+                        row_edit_requests.push(row_idx);
+                    }
                     None => {}
                 }
             });
@@ -226,6 +235,9 @@ pub fn show_panel(ui: &mut egui::Ui, state: &mut AppState, theme: &Theme) {
                 req.nullable,
                 req.identity,
             );
+        }
+        for row_idx in row_edit_requests {
+            state.open_edit_row(row_idx);
         }
     } else {
         ui.vertical_centered(|ui| {

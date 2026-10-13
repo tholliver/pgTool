@@ -3,6 +3,7 @@ use crate::app::state::{AppState, Candidate, CandidateKind};
 pub mod appicon;
 pub mod connection_dialog;
 pub mod error_strip;
+pub mod explain_panel;
 pub mod header;
 pub mod results;
 pub mod sidebar;
@@ -105,14 +106,14 @@ pub fn draw(
                 let handle_height = 6.0;
 
                 const MIN_EDITOR_H: f32 = 170.0; // header + a few SQL lines
-                const MIN_RESULTS_H: f32 = 140.0; // filter bar + pagination + some rows
+                const MIN_RESULTS_H: f32 = 56.0; // search bar + pagination row, grid sliver
 
                 // Exact budget: editor + handle + results must always equal
                 // the available height, otherwise one half overflows past
                 // the window bottom instead of the divider moving.
                 let usable = (total_height - handle_height).max(0.0);
                 let editor_height = if usable >= MIN_EDITOR_H + MIN_RESULTS_H {
-                    let ratio = state.query.results_split_ratio.clamp(0.15, 0.85);
+                    let ratio = state.query.results_split_ratio.clamp(0.05, 0.95);
                     (usable * ratio).clamp(MIN_EDITOR_H, usable - MIN_RESULTS_H)
                 } else {
                     usable * 0.5 // window too small for minimums — split evenly
@@ -141,7 +142,7 @@ pub fn draw(
                 if handle_resp.dragged() {
                     let delta_ratio = handle_resp.drag_delta().y / total_height.max(1.0);
                     state.query.results_split_ratio =
-                        (state.query.results_split_ratio + delta_ratio).clamp(0.15, 0.85);
+                        (state.query.results_split_ratio + delta_ratio).clamp(0.05, 0.95);
                 }
 
                 // -- results, bottom half --
@@ -183,10 +184,24 @@ fn draw_sql_editor(ui: &mut egui::Ui, state: &mut AppState, theme: &Theme) {
     ui.add_space(6.0);
 
     const CTRL_ROW_H: f32 = 28.0; // toolbar icons + Run button row
-    // The text area takes ALL height left above the control row, and the
-    // ScrollArea keeps its content inside that box — so the editor can never
-    // outgrow its half of the split and push the results panel downward.
-    let text_area_h = (ui.available_height() - CTRL_ROW_H - 12.0).max(40.0);
+    // The text area takes ALL height left above the bottom chrome (toolbar,
+    // error banner, execution-plan panel), and the ScrollArea keeps its
+    // content inside that box — so the editor can never outgrow its half of
+    // the split and push the results panel downward.
+    const ERROR_BANNER_H: f32 = 40.0; // headline row + frame margins
+    const PLAN_HEADER_H: f32 = 30.0;
+    const PLAN_BODY_H: f32 = 190.0; // scroll cap + copy row + spacing
+    let mut bottom_chrome = CTRL_ROW_H + 12.0 + 6.0;
+    if state.query.last_error.is_some() {
+        bottom_chrome += ERROR_BANNER_H;
+    }
+    if state.query.explain_result.is_some() {
+        bottom_chrome += PLAN_HEADER_H;
+        if state.query.explain_panel_open {
+            bottom_chrome += PLAN_BODY_H;
+        }
+    }
+    let text_area_h = (ui.available_height() - bottom_chrome).max(40.0);
 
     ui.allocate_ui(egui::vec2(ui.available_width(), text_area_h), |ui| {
         egui::Frame::new()
@@ -253,12 +268,50 @@ fn draw_sql_editor(ui: &mut egui::Ui, state: &mut AppState, theme: &Theme) {
         ui.separator();
         ui.add_space(4.0);
 
-        toolbar_icon(
-            ui,
-            theme,
-            egui_phosphor::regular::MAGNIFYING_GLASS,
-            "Explain query",
+        let explain_active = state.query.explain_analyze;
+        let explain_resp = ui.add_enabled(
+            !state.is_loading() && !state.query.sql.trim().is_empty(),
+            egui::Button::new(
+                egui::RichText::new(egui_phosphor::regular::MAGNIFYING_GLASS)
+                    .color(if explain_active { theme.accent } else { theme.text_muted })
+                    .size(15.0),
+            )
+            .fill(if explain_active {
+                theme.accent_muted
+            } else {
+                egui::Color32::TRANSPARENT
+            }),
         );
+        if explain_resp.clicked() {
+            state.explain_query(state.query.explain_analyze);
+        }
+        explain_resp.context_menu(|ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("EXPLAIN").color(theme.text).size(12.0).strong());
+                ui.checkbox(&mut state.query.explain_analyze, "ANALYZE");
+            });
+            ui.label(
+                egui::RichText::new(
+                    "ANALYZE executes the query for real timings.\n\
+                     It is disabled for INSERT / UPDATE / DELETE / DDL.",
+                )
+                .color(theme.text_muted)
+                .size(10.5),
+            );
+            ui.separator();
+            if ui
+                .add(egui::Button::new("Run explain").min_size(egui::vec2(90.0, 24.0)))
+                .clicked()
+            {
+                state.explain_query(state.query.explain_analyze);
+                ui.close();
+            }
+        });
+        explain_resp.on_hover_text(if explain_active {
+            "Explain query (ANALYZE)"
+        } else {
+            "Explain query \u{2014} right-click to toggle ANALYZE"
+        });
         toolbar_icon(
             ui,
             theme,
@@ -296,6 +349,10 @@ fn draw_sql_editor(ui: &mut egui::Ui, state: &mut AppState, theme: &Theme) {
                     handle.abort();
                 }
                 state.query.query_promise = None;
+                if let Some(handle) = state.query.explain_cancel.take() {
+                    handle.abort();
+                }
+                state.query.explain_promise = None;
                 state.query.status = "Cancelled".into();
             }
         });
@@ -303,9 +360,13 @@ fn draw_sql_editor(ui: &mut egui::Ui, state: &mut AppState, theme: &Theme) {
 
     ui.add_space(6.0);
     error_strip::draw(ui, state, theme);
+    explain_panel::draw(ui, state, theme);
 
     // cell-edit dialog (modal on top of everything, like the others)
     results::edit_dialog::show(ui.ctx(), state, theme);
+
+    // full-row edit dialog (mutually exclusive entry points, both modal)
+    results::row_edit_dialog::show(ui.ctx(), state, theme);
 }
 
 /// Custom window titlebar: app icon, drag-to-move, double-click to
@@ -658,24 +719,36 @@ fn show_autocomplete_popup(
                         let resp = ui
                             .horizontal(|ui| {
                                 ui.label(egui::RichText::new(icon).color(icon_color).size(12.0));
-                                ui.add(
-                                    egui::Button::new(
-                                        egui::RichText::new(&cand.name)
-                                            .monospace()
-                                            .size(12.0)
-                                            .color(if selected {
-                                                theme.accent
+                                // `left_to_right` centers text inside buttons by
+                                // default; a dedicated child ui with a left
+                                // main-align keeps the fixed-width row while the
+                                // candidate name stays left-aligned.
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(140.0, 18.0),
+                                    egui::Layout::left_to_right(egui::Align::Center)
+                                        .with_main_align(egui::Align::Min),
+                                    |ui| {
+                                        ui.add(
+                                            egui::Button::new(
+                                                egui::RichText::new(&cand.name)
+                                                    .monospace()
+                                                    .size(12.0)
+                                                    .color(if selected {
+                                                        theme.accent
+                                                    } else {
+                                                        theme.text
+                                                    }),
+                                            )
+                                            .fill(if selected {
+                                                theme.accent_muted
                                             } else {
-                                                theme.text
-                                            }),
-                                    )
-                                    .fill(if selected {
-                                        theme.accent_muted
-                                    } else {
-                                        egui::Color32::TRANSPARENT
-                                    })
-                                    .min_size(egui::vec2(140.0, 18.0)),
+                                                egui::Color32::TRANSPARENT
+                                            })
+                                            .min_size(egui::vec2(140.0, 18.0)),
+                                        )
+                                    },
                                 )
+                                .inner
                             })
                             .inner;
                         if resp.clicked() {
