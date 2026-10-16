@@ -2,10 +2,13 @@ use crate::app::state::{AppState, Candidate, CandidateKind};
 
 pub mod appicon;
 pub mod connection_dialog;
+pub mod drop_schema_dialog;
 pub mod error_strip;
 pub mod explain_panel;
 pub mod header;
+pub mod password_prompt;
 pub mod results;
+pub mod schema_name_dialog;
 pub mod sidebar;
 pub mod sql_highlight;
 pub mod theme;
@@ -23,6 +26,9 @@ pub fn draw(
 
     // connection dialog (modal, drawn on top of everything)
     connection_dialog::show(ui.ctx(), &mut state.connection.dialog, theme);
+
+    // password prompt (modal, drawn on top of everything)
+    password_prompt::show(ui.ctx(), state, theme);
 
     // destructive-statement confirmation (modal on top of the dialog too)
     if let Some(sql) = state.query.pending_confirm_sql.clone() {
@@ -251,12 +257,7 @@ fn draw_sql_editor(ui: &mut egui::Ui, state: &mut AppState, theme: &Theme) {
             egui_phosphor::regular::MAGIC_WAND,
             "Format query",
         );
-        toolbar_icon(
-            ui,
-            theme,
-            egui_phosphor::regular::FLOPPY_DISK,
-            "Save query",
-        );
+        toolbar_icon(ui, theme, egui_phosphor::regular::FLOPPY_DISK, "Save query");
         toolbar_icon(
             ui,
             theme,
@@ -273,7 +274,11 @@ fn draw_sql_editor(ui: &mut egui::Ui, state: &mut AppState, theme: &Theme) {
             !state.is_loading() && !state.query.sql.trim().is_empty(),
             egui::Button::new(
                 egui::RichText::new(egui_phosphor::regular::MAGNIFYING_GLASS)
-                    .color(if explain_active { theme.accent } else { theme.text_muted })
+                    .color(if explain_active {
+                        theme.accent
+                    } else {
+                        theme.text_muted
+                    })
                     .size(15.0),
             )
             .fill(if explain_active {
@@ -287,7 +292,12 @@ fn draw_sql_editor(ui: &mut egui::Ui, state: &mut AppState, theme: &Theme) {
         }
         explain_resp.context_menu(|ui| {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("EXPLAIN").color(theme.text).size(12.0).strong());
+                ui.label(
+                    egui::RichText::new("EXPLAIN")
+                        .color(theme.text)
+                        .size(12.0)
+                        .strong(),
+                );
                 ui.checkbox(&mut state.query.explain_analyze, "ANALYZE");
             });
             ui.label(
@@ -312,12 +322,7 @@ fn draw_sql_editor(ui: &mut egui::Ui, state: &mut AppState, theme: &Theme) {
         } else {
             "Explain query \u{2014} right-click to toggle ANALYZE"
         });
-        toolbar_icon(
-            ui,
-            theme,
-            egui_phosphor::regular::EXPORT,
-            "Export results",
-        );
+        toolbar_icon(ui, theme, egui_phosphor::regular::EXPORT, "Export results");
         toolbar_icon(ui, theme, egui_phosphor::regular::COPY, "Copy results");
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -367,6 +372,12 @@ fn draw_sql_editor(ui: &mut egui::Ui, state: &mut AppState, theme: &Theme) {
 
     // full-row edit dialog (mutually exclusive entry points, both modal)
     results::row_edit_dialog::show(ui.ctx(), state, theme);
+
+    // delete schema dialog
+    drop_schema_dialog::show(ui.ctx(), state, theme);
+
+    // schema name dialog (new/rename)
+    schema_name_dialog::show(ui.ctx(), state, theme);
 }
 
 /// Custom window titlebar: app icon, drag-to-move, double-click to
@@ -408,7 +419,14 @@ fn draw_titlebar(
             let center_y = full.center().y;
             let font = egui::FontId::proportional(12.0);
 
-            paint_titlebar_text(ui, &mut cursor_x, center_y, &font, "pgTool", theme.text_muted);
+            paint_titlebar_text(
+                ui,
+                &mut cursor_x,
+                center_y,
+                &font,
+                "pgTool",
+                theme.text_muted,
+            );
             paint_titlebar_text(ui, &mut cursor_x, center_y, &font, "/", theme.border);
 
             if let Some(profile) = state
@@ -548,8 +566,12 @@ fn draw_titlebar(
 fn toolbar_icon(ui: &mut egui::Ui, theme: &Theme, glyph: &str, tooltip: &str) {
     ui.add_enabled(
         false,
-        egui::Button::new(egui::RichText::new(glyph).color(theme.text_muted).size(15.0))
-            .fill(egui::Color32::TRANSPARENT),
+        egui::Button::new(
+            egui::RichText::new(glyph)
+                .color(theme.text_muted)
+                .size(15.0),
+        )
+        .fill(egui::Color32::TRANSPARENT),
     )
     .on_disabled_hover_text(tooltip);
 }

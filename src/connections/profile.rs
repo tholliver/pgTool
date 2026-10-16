@@ -5,6 +5,8 @@ pub enum SslMode {
     Disable,
     Prefer,
     Require,
+    VerifyCa,
+    VerifyFull,
 }
 
 impl SslMode {
@@ -13,11 +15,19 @@ impl SslMode {
             Self::Disable => "disable",
             Self::Prefer => "prefer",
             Self::Require => "require",
+            Self::VerifyCa => "verify-ca",
+            Self::VerifyFull => "verify-full",
         }
     }
 
     pub fn all() -> Vec<SslMode> {
-        vec![SslMode::Disable, SslMode::Prefer, SslMode::Require]
+        vec![
+            SslMode::Disable,
+            SslMode::Prefer,
+            SslMode::Require,
+            SslMode::VerifyCa,
+            SslMode::VerifyFull,
+        ]
     }
 }
 
@@ -39,8 +49,9 @@ pub struct ConnectionProfile {
     pub database: Option<String>,
     pub username: String,
     pub ssl_mode: SslMode,
+    /// Optional path to CA certificate for verify-ca/verify-full modes.
     #[serde(default)]
-    pub password: String,
+    pub ssl_ca_path: Option<String>,
 }
 
 impl ConnectionProfile {
@@ -58,23 +69,6 @@ impl ConnectionProfile {
             Some(db) if !db.is_empty() => db.as_str(),
             _ => "postgres",
         }
-    }
-
-    /// Unique ID derived from connection credentials (no password).
-    /// Two profiles pointing at the same server/db always get the same ID.
-    pub fn credential_id(
-        host: &str,
-        port: u16,
-        database: Option<&str>,
-        ssl_mode: &SslMode,
-    ) -> String {
-        format!(
-            "postgres://{}:{}/{}?sslmode={}",
-            host,
-            port,
-            database.unwrap_or(""),
-            ssl_mode,
-        )
     }
 
     pub fn connection_url(&self, password: &str) -> String {
@@ -101,17 +95,6 @@ impl ConnectionProfile {
             database,
             self.ssl_mode.as_str(),
         )
-    }
-
-    /// Display label — falls back to {host}:{port} when name is empty.
-    pub fn display_name(&self) -> &str {
-        if self.name.is_empty() {
-            // can't return a temporary, so we use a trick: return the name field
-            // and callers should check is_empty() themselves
-            &self.name
-        } else {
-            &self.name
-        }
     }
 
     /// Generated display name for when name is empty.

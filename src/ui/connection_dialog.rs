@@ -121,38 +121,73 @@ pub fn show(ctx: &egui::Context, dialog: &mut ConnectionDialog, theme: &Theme) {
                 ui.add_space(4.0);
             }
 
-            ui.horizontal(|ui| {
-                let label = if dialog.testing {
-                    "Testing..."
-                } else {
-                    "Test & Connect"
-                };
-                let btn = ui.add_enabled(
-                    !dialog.testing,
-                    egui::Button::new(
-                        egui::RichText::new(label)
-                            .color(egui::Color32::WHITE)
-                            .strong(),
-                    )
-                    .fill(theme.accent)
-                    .corner_radius(6)
-                    .min_size(egui::vec2(130.0, 32.0)),
-                );
-                if btn.clicked() && !dialog.testing {
-                    dialog.start_test();
-                }
-
-                if ui
-                    .add(
-                        egui::Button::new("Cancel")
+            // Duplicate warning with "Save anyway" button
+            if let Some((warn, _, _)) = &dialog.pending_duplicate {
+                ui.label(egui::RichText::new(warn.as_str()).color(theme.accent));
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("Save anyway")
+                                    .color(egui::Color32::WHITE)
+                                    .strong(),
+                            )
+                            .fill(theme.accent)
                             .corner_radius(6)
-                            .min_size(egui::vec2(80.0, 32.0)),
-                    )
-                    .clicked()
-                {
-                    dialog.close();
-                }
-            });
+                            .min_size(egui::vec2(130.0, 32.0)),
+                        )
+                        .clicked()
+                    {
+                        // Signal to AppState to confirm duplicate save
+                        dialog.confirm_duplicate_save_requested = true;
+                    }
+                    if ui
+                        .add(
+                            egui::Button::new("Cancel")
+                                .corner_radius(6)
+                                .min_size(egui::vec2(80.0, 32.0)),
+                        )
+                        .clicked()
+                    {
+                        dialog.pending_duplicate = None;
+                        dialog.testing = false;
+                    }
+                });
+            } else {
+                ui.horizontal(|ui| {
+                    let label = if dialog.testing {
+                        "Testing..."
+                    } else {
+                        "Test & Connect"
+                    };
+                    let btn = ui.add_enabled(
+                        !dialog.testing,
+                        egui::Button::new(
+                            egui::RichText::new(label)
+                                .color(egui::Color32::WHITE)
+                                .strong(),
+                        )
+                        .fill(theme.accent)
+                        .corner_radius(6)
+                        .min_size(egui::vec2(130.0, 32.0)),
+                    );
+                    if btn.clicked() && !dialog.testing {
+                        dialog.start_test();
+                    }
+
+                    if ui
+                        .add(
+                            egui::Button::new("Cancel")
+                                .corner_radius(6)
+                                .min_size(egui::vec2(80.0, 32.0)),
+                        )
+                        .clicked()
+                    {
+                        dialog.close();
+                    }
+                });
+            }
         });
 }
 

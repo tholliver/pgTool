@@ -174,7 +174,8 @@ pub async fn load_views(pool: &PgPool, schema: &str) -> Result<Vec<ViewInfo>> {
     .map(|r| {
         (
             r.get::<String, _>("table_name"),
-            r.get::<Option<String>, _>("view_definition").unwrap_or_default(),
+            r.get::<Option<String>, _>("view_definition")
+                .unwrap_or_default(),
         )
     })
     .collect();
@@ -400,7 +401,9 @@ pub async fn load_foreign_keys(
         } else {
             format!("{ref_schema}.{ref_table}")
         };
-        let e = map.entry(name).or_insert_with(|| (Vec::new(), String::new(), Vec::new()));
+        let e = map
+            .entry(name)
+            .or_insert_with(|| (Vec::new(), String::new(), Vec::new()));
         e.0.push(column);
         if e.1.is_empty() {
             e.1 = qualified_ref;
@@ -425,11 +428,7 @@ pub async fn load_foreign_keys(
 /// Triggers on one table plus indexes and foreign keys, fetched together on
 /// demand when a table node is expanded (keeps the eager schema load cheap —
 /// one query per table, not four).
-pub async fn load_table_details(
-    pool: &PgPool,
-    schema: &str,
-    table: &str,
-) -> Result<TableDetails> {
+pub async fn load_table_details(pool: &PgPool, schema: &str, table: &str) -> Result<TableDetails> {
     let indexes = load_indexes(pool, schema, table).await?;
     let foreign_keys = load_foreign_keys(pool, schema, table).await?;
     let triggers = load_triggers(pool, schema, table).await?;

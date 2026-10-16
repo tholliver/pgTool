@@ -95,19 +95,10 @@ pub fn show_panel(ui: &mut egui::Ui, state: &mut AppState, theme: &Theme) {
         if feedback_expired {
             state.query.copy_feedback = None;
         }
-        let feedback: Option<String> = state
-            .query
-            .copy_feedback
-            .as_ref()
-            .map(|fb| fb.text.clone());
+        let feedback: Option<String> = state.query.copy_feedback.as_ref().map(|fb| fb.text.clone());
 
         // search bar ("Copied …" chip rides along on its right edge)
-        search_bar::show(
-            ui,
-            &mut state.query.filter_text,
-            theme,
-            feedback.as_deref(),
-        );
+        search_bar::show(ui, &mut state.query.filter_text, theme, feedback.as_deref());
 
         let mut action: Option<Action> = None;
         let mut edit_requests: Vec<EditRequest> = Vec::new();

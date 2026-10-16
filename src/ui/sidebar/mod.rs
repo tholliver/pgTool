@@ -211,18 +211,27 @@ pub fn show_tree(ui: &mut egui::Ui, state: &mut AppState, theme: &Theme) {
                     ui.close();
                 }
                 if ui.small_button("Edit").clicked() {
-                    state
-                        .connection
-                        .dialog
-                        .open_edit(profile, &profile.password);
+                    state.open_edit_profile(&profile.id);
+                    ui.close();
+                }
+                if is_active
+                    && !profile.browse_all_databases()
+                    && ui.small_button("New schema…").clicked()
+                {
+                    state.open_create_schema(None);
                     ui.close();
                 }
                 if ui.small_button("Delete").clicked() {
                     state.connection.profiles.retain(|p| p.id != profile.id);
-                    let _ = crate::connections::save_profiles(&state.connection.profiles);
+                    if let Err(e) = state.connection.repo.save(&state.connection.profiles) {
+                        state.query.status = format!("Failed to save profiles: {}", e);
+                    }
+                    // Also delete the secret
+                    let _ = state.connection.secrets.delete(&profile.id);
                     if state.connection.active_id.as_deref() == Some(&profile.id) {
                         state.connection.active_id = None;
                         state.connection.active_pool = None;
+                        state.connection.active_password = None;
                         state.clear_query_state();
                     }
                     ui.close();
@@ -311,6 +320,20 @@ fn render_databases(ui: &mut egui::Ui, state: &mut AppState, theme: &Theme) {
                 state.expand_database(&db_name);
             }
         }
+
+        // Database context menu (browse-all mode)
+        resp.context_menu(|ui| {
+            if ui.button("New schema…").clicked() {
+                // Needs an open pool for this database.
+                state.expand_database(&db_name);
+                state.open_create_schema(Some(&db_name));
+                ui.close();
+            }
+            if ui.button("Refresh schemas").clicked() {
+                state.refresh_schemas(Some(&db_name));
+                ui.close();
+            }
+        });
 
         if is_expanded {
             let loading = state
@@ -444,6 +467,39 @@ fn render_schemas_for(
             }
         }
 
+        // Context menu for schema actions
+        resp.context_menu(|ui| {
+            let renamable = !crate::db::is_system_schema(&schema.name);
+            let droppable = !crate::db::is_protected_schema(&schema.name);
+            if ui.button("Refresh").clicked() {
+                state.refresh_schemas(db_name);
+                ui.close();
+            }
+            if ui.button("New schema…").clicked() {
+                state.open_create_schema(db_name);
+                ui.close();
+            }
+            ui.separator();
+            if ui.button("Copy name").clicked() {
+                ui.ctx().copy_text(schema.name.clone());
+                ui.close();
+            }
+            if ui
+                .add_enabled(renamable, egui::Button::new("Rename…"))
+                .clicked()
+            {
+                state.open_rename_schema(db_name, &schema.name);
+                ui.close();
+            }
+            ui.separator();
+            let delete =
+                egui::Button::new(egui::RichText::new("Delete schema…").color(theme.danger));
+            if ui.add_enabled(droppable, delete).clicked() {
+                state.open_drop_schema(db_name, &schema.name, schema.tables.len());
+                ui.close();
+            }
+        });
+
         if show_tables {
             // Preserve original indices — selection uses (schema_idx, table_idx).
             let matching: Vec<(usize, &crate::db::TableInfo)> = schema
@@ -469,10 +525,8 @@ fn render_schemas_for(
                             && state.query.table_idx == ti;
                         let schema_name = schema.name.clone();
                         let table_name = table.name.clone();
-                        let detail_key =
-                            (db_name.map(str::to_owned), schema_name, table_name);
-                        let is_detail_expanded =
-                            state.query.expanded_tables.contains(&detail_key);
+                        let detail_key = (db_name.map(str::to_owned), schema_name, table_name);
+                        let is_detail_expanded = state.query.expanded_tables.contains(&detail_key);
 
                         // 1. reserve the row's space, 2. ask for interaction,
                         // 3. NOW we know hover/selection and can paint the bg.
@@ -663,10 +717,15 @@ fn render_table_details(ui: &mut egui::Ui, theme: &Theme, table: &crate::db::Tab
         for idx in &table.indexes {
             let tag = if idx.is_unique { " UNIQUE" } else { "" };
             ui.label(
-                egui::RichText::new(format!("  {} ({}){}", idx.name, idx.columns.join(", "), tag))
-                    .color(theme.text)
-                    .monospace()
-                    .size(11.5),
+                egui::RichText::new(format!(
+                    "  {} ({}){}",
+                    idx.name,
+                    idx.columns.join(", "),
+                    tag
+                ))
+                .color(theme.text)
+                .monospace()
+                .size(11.5),
             );
         }
     }

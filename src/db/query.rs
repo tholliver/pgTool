@@ -18,11 +18,7 @@ pub async fn execute_query(pool: &PgPool, sql: &str) -> Result<QueryResult> {
 
     while let Some(row) = stream.try_next().await.context("query failed")? {
         if columns.is_empty() {
-            columns = row
-                .columns()
-                .iter()
-                .map(|c| c.name().to_string())
-                .collect();
+            columns = row.columns().iter().map(|c| c.name().to_string()).collect();
             column_types = row
                 .columns()
                 .iter()
@@ -125,7 +121,9 @@ pub async fn execute_explain(pool: &PgPool, sql: &str, analyze: bool) -> Result<
         if !val.is_null() {
             match val.as_str() {
                 Ok(s) => plan.push_str(s),
-                Err(_) => plan.push_str(&String::from_utf8_lossy(val.as_bytes().unwrap_or_default())),
+                Err(_) => {
+                    plan.push_str(&String::from_utf8_lossy(val.as_bytes().unwrap_or_default()))
+                }
             }
         }
     }
@@ -167,13 +165,7 @@ pub async fn execute_row_update(
     let where_clause = identity
         .iter()
         .enumerate()
-        .map(|(i, (col, _))| {
-            format!(
-                "{} = ${}",
-                quote_ident(col),
-                i + 1 + updates.len()
-            )
-        })
+        .map(|(i, (col, _))| format!("{} = ${}", quote_ident(col), i + 1 + updates.len()))
         .collect::<Vec<_>>()
         .join(" AND ");
     let sql = format!("UPDATE {table_ident} SET {set_clause} WHERE {where_clause}");
@@ -291,4 +283,146 @@ mod tests {
 
         pool.close().await;
     }
+}
+
+#[test]
+    fn schema_classification() {
+        assert!(is_temp_schema("pg_temp_12"));
+        assert!(is_temp_schema("pg_toast_temp_42"));
+        assert!(!is_temp_schema("pg_temp_"));
+        assert!(!is_temp_schema("pg_temp_x"));
+        assert!(!is_protected_schema("pg_temp_12"), "leftover temp schemas are droppable");
+        assert!(is_protected_schema("pg_catalog"));
+        assert!(is_protected_schema("pg_toast"));
+        assert!(is_protected_schema("information_schema"));
+        assert!(!is_protected_schema("public"));
+        assert!(is_system_schema("pg_temp_12"), "but never renamable or creatable");
+    }
+
+    #[test]
+    fn schema_name_validation() {
+    assert!(validate_schema_name("sales").is_ok());
+    assert!(validate_schema_name("My Schema").is_ok());
+    assert!(validate_schema_name("").is_err());
+    assert!(validate_schema_name("pg_custom").is_err());
+    assert!(validate_schema_name("information_schema").is_err());
+    assert!(validate_schema_name(&"x".repeat(64)).is_err());
+}
+
+/// Live create -> rename -> drop cycle (skips without DATABASE_URL).
+#[tokio::test]
+async fn schema_create_rename_drop_cycle() {
+    dotenvy::dotenv().ok();
+    let Ok(url) = std::env::var("DATABASE_URL") else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let Ok(pool) = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+    else {
+        eprintln!("skipping: cannot reach database");
+        return;
+    };
+    let (a, b) = ("pgtool_test_a", "pgtool test \"b\"");
+    let _ = drop_schema(&pool, a, true).await;
+    let _ = drop_schema(&pool, b, true).await;
+
+    create_schema(&pool, a).await.unwrap();
+    assert!(
+        create_schema(&pool, a).await.is_err(),
+        "duplicate must fail"
+    );
+    rename_schema(&pool, a, b).await.unwrap();
+    sqlx::raw_sql(&format!("CREATE TABLE {}.t (id int)", quote_ident(b)))
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        drop_schema(&pool, b, false).await.is_err(),
+        "RESTRICT must fail on a non-empty schema"
+    );
+    drop_schema(&pool, b, true).await.unwrap();
+    assert!(drop_schema(&pool, "pg_catalog", true).await.is_err());
+}
+
+/// Validate a user-typed schema name before CREATE / RENAME.
+pub fn validate_schema_name(name: &str) -> Result<()> {
+    anyhow::ensure!(!name.is_empty(), "Schema name cannot be empty");
+    anyhow::ensure!(name.len() <= 63, "Schema name is too long (max 63 bytes)");
+    anyhow::ensure!(
+        !is_system_schema(name),
+        "Names starting with \"pg_\" or equal to \"information_schema\" are reserved"
+    );
+    Ok(())
+}
+
+/// CREATE SCHEMA with a quoted identifier (case and spaces preserved).
+pub async fn create_schema(pool: &PgPool, name: &str) -> Result<()> {
+    validate_schema_name(name)?;
+    let sql = format!("CREATE SCHEMA {}", quote_ident(name));
+    sqlx::raw_sql(&sql)
+        .execute(pool)
+        .await
+        .with_context(|| format!("CREATE SCHEMA {name} failed"))?;
+    Ok(())
+}
+
+/// ALTER SCHEMA ... RENAME TO. Dependent objects follow the rename.
+pub async fn rename_schema(pool: &PgPool, old: &str, new: &str) -> Result<()> {
+    anyhow::ensure!(
+        !is_system_schema(old),
+        "system schema \"{old}\" cannot be renamed"
+    );
+    validate_schema_name(new)?;
+    let sql = format!(
+        "ALTER SCHEMA {} RENAME TO {}",
+        quote_ident(old),
+        quote_ident(new)
+    );
+    sqlx::raw_sql(&sql)
+        .execute(pool)
+        .await
+        .with_context(|| format!("RENAME SCHEMA {old} failed"))?;
+    Ok(())
+}
+
+/// Names Postgres reserves for itself: `information_schema` and every `pg_*`.
+pub fn is_system_schema(name: &str) -> bool {
+    name == "information_schema" || name.starts_with("pg_")
+}
+
+/// Per-session scratch schemas Postgres leaves behind after a connection
+/// slot used a temp table (`pg_temp_N` / `pg_toast_temp_N`).
+pub fn is_temp_schema(name: &str) -> bool {
+    ["pg_temp_", "pg_toast_temp_"].iter().any(|prefix| {
+        name.strip_prefix(prefix)
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    })
+}
+
+/// Schemas that must never be dropped via the UI: system schemas, except the
+/// leftover temp scratch schemas (Postgres recreates those on demand).
+pub fn is_protected_schema(name: &str) -> bool {
+    is_system_schema(name) && !is_temp_schema(name)
+}
+
+/// DROP SCHEMA. RESTRICT fails if the schema still has objects; CASCADE removes
+/// them all. Auto-committed, so it cannot be undone.
+pub async fn drop_schema(pool: &PgPool, schema: &str, cascade: bool) -> Result<()> {
+    anyhow::ensure!(
+        !is_protected_schema(schema),
+        "system schema \"{schema}\" cannot be dropped"
+    );
+    let sql = format!(
+        "DROP SCHEMA {} {}",
+        quote_ident(schema),
+        if cascade { "CASCADE" } else { "RESTRICT" }
+    );
+    sqlx::raw_sql(&sql)
+        .execute(pool)
+        .await
+        .with_context(|| format!("DROP SCHEMA {schema} failed"))?;
+    Ok(())
 }

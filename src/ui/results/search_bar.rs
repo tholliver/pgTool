@@ -2,12 +2,7 @@ use crate::ui::theme::Theme;
 
 /// Transient success/notification line shown on the right of the filter bar
 /// (e.g. "Copied …from col"). `None` renders nothing.
-pub fn show(
-    ui: &mut egui::Ui,
-    filter_text: &mut String,
-    theme: &Theme,
-    feedback: Option<&str>,
-) {
+pub fn show(ui: &mut egui::Ui, filter_text: &mut String, theme: &Theme, feedback: Option<&str>) {
     ui.horizontal(|ui| {
         ui.label(
             egui::RichText::new("Filter:")

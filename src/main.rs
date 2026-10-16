@@ -7,6 +7,7 @@ mod app;
 mod connections;
 mod db;
 mod query_builder;
+mod services;
 mod ui;
 
 use dotenvy::dotenv;

@@ -1,8 +1,11 @@
 use crate::connections::{ConnectionProfile, SslMode};
 use crate::db;
 use crate::query_builder::QueryBuilder;
+use crate::services::{ProfileRepo, SecretStore};
 use poll_promise::Promise;
 use sqlx::PgPool;
+use std::sync::Arc;
+use uuid::Uuid;
 
 #[derive(PartialEq)]
 pub enum Focus {
@@ -35,17 +38,65 @@ type DbSchemaPromise = Promise<anyhow::Result<(PgPool, Vec<db::SchemaInfo>)>>;
 /// the table's indexes/foreign-keys/triggers.
 type TableDetailPromise = Promise<anyhow::Result<db::TableDetails>>;
 
+/// Modal password prompt for a saved connection with no stored secret.
+#[derive(Default)]
+pub struct PasswordPrompt {
+    pub open: bool,
+    pub profile_id: String,
+    pub profile_name: String,
+    pub password: String,
+    pub remember: bool,
+    pub error: Option<String>,
+    pub submitting: bool,
+    pub test_promise: Option<Promise<Result<PgPool, anyhow::Error>>>,
+    /// If test succeeds and duplicate is found, hold the profile + pool here
+    /// until user confirms.
+    pub pending_duplicate: Option<(String, ConnectionProfile, PgPool)>,
+}
+
+impl PasswordPrompt {
+    pub fn open(&mut self, profile: &ConnectionProfile) {
+        self.open = true;
+        self.profile_id = profile.id.clone();
+        self.profile_name = profile.generated_name();
+        self.password.clear();
+        self.remember = true;
+        self.error = None;
+        self.submitting = false;
+        self.test_promise = None;
+        self.pending_duplicate = None;
+    }
+
+    pub fn close(&mut self) {
+        self.open = false;
+        self.profile_id.clear();
+        self.profile_name.clear();
+        self.password.clear();
+        self.error = None;
+        self.submitting = false;
+        self.test_promise = None;
+        self.pending_duplicate = None;
+    }
+}
+
 pub struct ConnectionState {
     pub profiles: Vec<ConnectionProfile>,
     pub active_id: Option<String>,
     pub active_pool: Option<PgPool>,
+    /// Cached password for the active connection (used for browse-all database switching).
+    pub active_password: Option<String>,
     pub dialog: ConnectionDialog,
+    pub password_prompt: PasswordPrompt,
+    pub repo: ProfileRepo,
+    pub secrets: Arc<dyn SecretStore>,
     pub menu_open: bool,
 }
 
 pub struct ConnectionDialog {
     pub open: bool,
     pub editing_id: Option<String>,
+    /// Stable UUID for this dialog session (generated on open_add, copied on open_edit).
+    pub id: String,
     pub name: String,
     pub host: String,
     pub port: String,
@@ -59,6 +110,11 @@ pub struct ConnectionDialog {
     pub error: Option<String>,
     pub testing: bool,
     pub test_promise: Option<Promise<Result<PgPool, anyhow::Error>>>,
+    /// If test succeeds and duplicate is found, hold the warning + profile + pool
+    /// until user confirms "Save anyway".
+    pub pending_duplicate: Option<(String, ConnectionProfile, PgPool)>,
+    /// Set by UI when user clicks "Save anyway" on duplicate warning.
+    pub confirm_duplicate_save_requested: bool,
 }
 
 impl Default for ConnectionDialog {
@@ -66,6 +122,7 @@ impl Default for ConnectionDialog {
         Self {
             open: false,
             editing_id: None,
+            id: String::new(),
             name: String::new(),
             host: "localhost".into(),
             port: "5432".into(),
@@ -77,6 +134,8 @@ impl Default for ConnectionDialog {
             error: None,
             testing: false,
             test_promise: None,
+            pending_duplicate: None,
+            confirm_duplicate_save_requested: false,
         }
     }
 }
@@ -85,6 +144,7 @@ impl ConnectionDialog {
     pub fn open_add(&mut self) {
         self.open = true;
         self.editing_id = None;
+        self.id = Uuid::new_v4().to_string();
         self.name.clear();
         self.host = "localhost".into();
         self.port = "5432".into();
@@ -101,6 +161,7 @@ impl ConnectionDialog {
     pub fn open_edit(&mut self, profile: &ConnectionProfile, password: &str) {
         self.open = true;
         self.editing_id = Some(profile.id.clone());
+        self.id = profile.id.clone();
         self.name = profile.name.clone();
         self.host = profile.host.clone();
         self.port = profile.port.to_string();
@@ -119,6 +180,8 @@ impl ConnectionDialog {
         self.error = None;
         self.testing = false;
         self.test_promise = None;
+        self.pending_duplicate = None;
+        self.confirm_duplicate_save_requested = false;
     }
 
     pub fn build_profile(&self) -> ConnectionProfile {
@@ -128,23 +191,20 @@ impl ConnectionDialog {
         } else {
             Some(self.database.clone())
         };
-        let id = self.editing_id.clone().unwrap_or_else(|| {
-            ConnectionProfile::credential_id(&self.host, port, database.as_deref(), &self.ssl_mode)
-        });
         let name = if self.name.trim().is_empty() {
             format!("{}:{}", self.host, port)
         } else {
             self.name.clone()
         };
         ConnectionProfile {
-            id,
+            id: self.id.clone(),
             name,
             host: self.host.clone(),
             port,
             database,
             username: self.username.clone(),
             ssl_mode: self.ssl_mode.clone(),
-            password: self.password.clone(),
+            ssl_ca_path: None,
         }
     }
 
@@ -271,6 +331,10 @@ pub struct QueryState {
     /// Lazy per-table detail load (indexes / fks / triggers), triggered by
     /// expanding a table node.
     pub table_detail_promise: Option<(Option<String>, String, String, TableDetailPromise)>,
+    /// Modal "Delete schema" dialog state.
+    pub drop_schema: Option<DropSchemaDialog>,
+    /// Modal "New schema" / "Rename schema" dialog state.
+    pub schema_name_dialog: Option<SchemaNameDialog>,
 }
 
 /// Short-lived notification that a cell value was copied to the clipboard;
@@ -369,6 +433,38 @@ pub struct RowEditDialog {
     pub promise: Option<Promise<anyhow::Result<u64>>>,
 }
 
+/// Modal "Delete schema" dialog state.
+#[derive(Default)]
+pub struct DropSchemaDialog {
+    /// Some(db) in browse-all mode, None in single-database mode.
+    pub database: Option<String>,
+    pub schema: String,
+    pub table_count: usize,
+    pub confirm_text: String,
+    pub cascade: bool,
+    pub error: Option<String>,
+    pub promise: Option<Promise<anyhow::Result<()>>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SchemaNameMode {
+    Create,
+    Rename,
+}
+
+/// Modal dialog shared by "New schema" and "Rename schema".
+pub struct SchemaNameDialog {
+    pub mode: SchemaNameMode,
+    /// Some(db) in browse-all mode, None in single-database mode.
+    pub database: Option<String>,
+    /// Existing name (Rename only; empty for Create).
+    pub old_name: String,
+    pub name: String,
+    pub focused: bool,
+    pub error: Option<String>,
+    pub promise: Option<Promise<anyhow::Result<()>>>,
+}
+
 impl Default for QueryState {
     fn default() -> Self {
         Self {
@@ -421,6 +517,8 @@ impl Default for QueryState {
             copy_feedback: None,
             edit: EditDialog::default(),
             row_edit: RowEditDialog::default(),
+            drop_schema: None,
+            schema_name_dialog: None,
             extensions: Vec::new(),
             extension_promise: None,
             expanded_tables: std::collections::HashSet::new(),
@@ -465,13 +563,29 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(rt: std::sync::Arc<tokio::runtime::Runtime>) -> Self {
-        let profiles = crate::connections::load_profiles().unwrap_or_default();
+        let secrets = Arc::new(crate::services::VaultStore::new()) as Arc<dyn SecretStore>;
+        let repo = ProfileRepo::new(secrets.clone());
+        let (profiles, warnings) = repo.load().unwrap_or_else(|e| {
+            tracing::error!("Failed to load profiles: {}", e);
+            (
+                Vec::new(),
+                vec![format!("Failed to load connections: {}", e)],
+            )
+        });
+        for w in &warnings {
+            tracing::warn!("{}", w);
+        }
+
         Self {
             connection: ConnectionState {
                 profiles,
                 active_id: None,
                 active_pool: None,
+                active_password: None,
                 dialog: ConnectionDialog::default(),
+                password_prompt: PasswordPrompt::default(),
+                repo,
+                secrets,
                 menu_open: false,
             },
             query: QueryState::default(),
@@ -529,6 +643,233 @@ impl AppState {
         }
     }
 
+    /// Open the "Delete schema" dialog for a schema in the given database.
+    /// `database` is None in single-database mode, Some(name) in browse-all mode.
+    pub fn open_drop_schema(&mut self, database: Option<&str>, schema: &str, table_count: usize) {
+        if crate::db::is_protected_schema(schema) {
+            return;
+        }
+        self.query.drop_schema = Some(DropSchemaDialog {
+            database: database.map(str::to_string),
+            schema: schema.to_string(),
+            table_count,
+            confirm_text: String::new(),
+            cascade: false,
+            error: None,
+            promise: None,
+        });
+    }
+
+    /// Confirm the schema deletion (called when user clicks "Delete schema" in the dialog).
+    pub fn confirm_drop_schema(&mut self) {
+        let pool = match self.query.drop_schema.as_ref() {
+            Some(d) => match &d.database {
+                Some(name) => self.query.database_pools.get(name).cloned(),
+                None => self.connection.active_pool.clone(),
+            },
+            None => return,
+        };
+        let Some(d) = self.query.drop_schema.as_mut() else {
+            return;
+        };
+        if d.promise.is_some() || d.confirm_text != d.schema {
+            return;
+        }
+        let Some(pool) = pool else {
+            d.error = Some("No open connection for this database".into());
+            return;
+        };
+        d.error = None;
+        let (schema, cascade) = (d.schema.clone(), d.cascade);
+        d.promise = Some(Promise::spawn_async(async move {
+            crate::db::drop_schema(&pool, &schema, cascade).await
+        }));
+    }
+
+    /// Poll the in-flight schema deletion. Returns true when the UI should repaint.
+    pub fn poll_drop_schema(&mut self) -> bool {
+        let outcome: Result<(), String> = match self
+            .query
+            .drop_schema
+            .as_ref()
+            .and_then(|d| d.promise.as_ref())
+        {
+            Some(p) => match p.ready() {
+                None => return false,
+                Some(Ok(())) => Ok(()),
+                Some(Err(e)) => Err(format!("{e:#}")),
+            },
+            None => return false,
+        };
+        match outcome {
+            Err(msg) => {
+                if let Some(d) = self.query.drop_schema.as_mut() {
+                    d.promise = None;
+                    d.error = Some(msg);
+                }
+            }
+            Ok(()) => {
+                let Some(d) = self.query.drop_schema.take() else {
+                    return true;
+                };
+                // Schema indices shift after a drop: reset selection and reload.
+                self.query.schema_idx = 0;
+                self.query.table_idx = 0;
+                self.query.result = None;
+                match &d.database {
+                    Some(name) => {
+                        self.query.expanded_db_schemas.retain(|(db, _)| db != name);
+                        if let Some(info) =
+                            self.query.databases.iter_mut().find(|x| x.name == *name)
+                        {
+                            info.loaded = false;
+                        }
+                        self.expand_database(name);
+                    }
+                    None => {
+                        self.query.expanded_schemas.clear();
+                        self.start_load_schemas();
+                    }
+                }
+                self.query.status = format!("Schema \"{}\" dropped", d.schema);
+            }
+        }
+        true
+    }
+
+    /// Pool for the given database (browse-all) or the single active pool.
+    fn schema_pool(&self, database: Option<&str>) -> Option<PgPool> {
+        match database {
+            Some(name) => self.query.database_pools.get(name).cloned(),
+            None => self.connection.active_pool.clone(),
+        }
+    }
+
+    /// Reload the schema list after a schema was created / renamed / dropped
+    /// (or on manual refresh). Schema indices shift, so selection and
+    /// expansion state tied to those indices is reset.
+    pub fn reload_schemas(&mut self, database: Option<&str>) {
+        self.query.schema_idx = 0;
+        self.query.table_idx = 0;
+        self.query.result = None;
+        match database {
+            Some(name) => {
+                self.query.expanded_db_schemas.retain(|(db, _)| db != name);
+                if let Some(info) = self.query.databases.iter_mut().find(|x| x.name == name) {
+                    info.loaded = false;
+                }
+                self.expand_database(name);
+            }
+            None => {
+                self.query.expanded_schemas.clear();
+                self.start_load_schemas();
+            }
+        }
+    }
+
+    /// Manual refresh of the schema list (this database in browse-all mode).
+    pub fn refresh_schemas(&mut self, database: Option<&str>) {
+        self.reload_schemas(database);
+    }
+
+    pub fn open_create_schema(&mut self, database: Option<&str>) {
+        self.query.schema_name_dialog = Some(SchemaNameDialog {
+            mode: SchemaNameMode::Create,
+            database: database.map(str::to_string),
+            old_name: String::new(),
+            name: String::new(),
+            focused: false,
+            error: None,
+            promise: None,
+        });
+    }
+
+    pub fn open_rename_schema(&mut self, database: Option<&str>, schema: &str) {
+        if crate::db::is_system_schema(schema) {
+            return;
+        }
+        self.query.schema_name_dialog = Some(SchemaNameDialog {
+            mode: SchemaNameMode::Rename,
+            database: database.map(str::to_string),
+            old_name: schema.to_string(),
+            name: schema.to_string(),
+            focused: false,
+            error: None,
+            promise: None,
+        });
+    }
+
+    pub fn confirm_schema_name(&mut self) {
+        let pool = match self.query.schema_name_dialog.as_ref() {
+            Some(d) => self.schema_pool(d.database.as_deref()),
+            None => return,
+        };
+        let Some(d) = self.query.schema_name_dialog.as_mut() else {
+            return;
+        };
+        if d.promise.is_some() {
+            return;
+        }
+        let name = d.name.trim().to_string();
+        if let Err(e) = crate::db::validate_schema_name(&name) {
+            d.error = Some(e.to_string());
+            return;
+        }
+        if d.mode == SchemaNameMode::Rename && name == d.old_name {
+            d.error = Some("Name is unchanged".into());
+            return;
+        }
+        let Some(pool) = pool else {
+            d.error = Some("No open connection for this database".into());
+            return;
+        };
+        d.error = None;
+        let (mode, old) = (d.mode, d.old_name.clone());
+        d.promise = Some(Promise::spawn_async(async move {
+            match mode {
+                SchemaNameMode::Create => crate::db::create_schema(&pool, &name).await,
+                SchemaNameMode::Rename => crate::db::rename_schema(&pool, &old, &name).await,
+            }
+        }));
+    }
+
+    /// Poll the in-flight create/rename. Returns true when the UI should repaint.
+    pub fn poll_schema_name(&mut self) -> bool {
+        let outcome: Result<(), String> = match self
+            .query
+            .schema_name_dialog
+            .as_ref()
+            .and_then(|d| d.promise.as_ref())
+        {
+            Some(p) => match p.ready() {
+                None => return false,
+                Some(Ok(())) => Ok(()),
+                Some(Err(e)) => Err(format!("{e:#}")),
+            },
+            None => return false,
+        };
+        match outcome {
+            Err(msg) => {
+                if let Some(d) = self.query.schema_name_dialog.as_mut() {
+                    d.promise = None;
+                    d.error = Some(msg);
+                }
+            }
+            Ok(()) => {
+                let Some(d) = self.query.schema_name_dialog.take() else {
+                    return true;
+                };
+                self.reload_schemas(d.database.as_deref());
+                let verb = match d.mode {
+                    SchemaNameMode::Create => "created",
+                    SchemaNameMode::Rename => "renamed",
+                };
+                self.query.status = format!("Schema \"{}\" {verb}", d.name.trim());
+            }
+        }
+        true
+    }
+
     /// Called when the user expands a database node in the sidebar tree.
     /// Lazily opens a second connection scoped to that database and loads
     /// its schemas; reuses an already-open pool on subsequent expands.
@@ -576,7 +917,8 @@ impl AppState {
             return;
         };
 
-        let url = profile.connection_url_for_database(&profile.password, db_name);
+        let password = self.connection.active_password.clone().unwrap_or_default();
+        let url = profile.connection_url_for_database(&password, db_name);
         let db_name_owned = db_name.to_string();
         self.query.status = format!("Connecting to {}...", db_name);
         self.query.db_schema_promise = Some((
@@ -600,19 +942,151 @@ impl AppState {
         }
         if let Some(profile) = self.connection.profiles.iter().find(|p| p.id == profile_id) {
             let profile = profile.clone();
-            let url = profile.connection_url(&profile.password);
-            let profile_id = profile.id.clone();
-            // We need to connect async — spawn it
-            let pool_promise =
-                poll_promise::Promise::spawn_async(async move { db::connect_with_url(&url).await });
-            // Store the promise and profile_id for polling
-            self.query.status = format!("Connecting to {}...", profile.name);
-            self.connection.active_id = Some(profile_id.clone());
-            self.query.expanded_connections.insert(profile_id);
-            self.clear_query_state();
-            // We'll need to handle this connect promise in poll_promises
-            // For now, store it as a special field
-            self.connect_promise = Some(pool_promise);
+            // Try to get password from keyring
+            match self.connection.secrets.get(&profile.id) {
+                Ok(Some(password)) => {
+                    self.start_connect(profile, password);
+                }
+                Ok(None) => {
+                    // No saved password - open password prompt
+                    self.connection.password_prompt.open(&profile);
+                }
+                Err(e) => {
+                    self.query.status = format!("Cannot read saved password: {}", e);
+                }
+            }
+        }
+    }
+
+    /// Start async connection with a known password.
+    fn start_connect(&mut self, profile: ConnectionProfile, password: String) {
+        let url = profile.connection_url(&password);
+        let profile_id = profile.id.clone();
+        let pool_promise =
+            poll_promise::Promise::spawn_async(async move { db::connect_with_url(&url).await });
+        self.query.status = format!("Connecting to {}...", profile.name);
+        self.connection.active_id = Some(profile_id.clone());
+        self.connection.active_password = Some(password);
+        self.query.expanded_connections.insert(profile_id);
+        self.clear_query_state();
+        self.connect_promise = Some(pool_promise);
+    }
+
+    /// Check if a profile with same host+port+database+username exists (different id).
+    fn find_duplicate(&self, profile: &ConnectionProfile) -> Option<(String, String)> {
+        self.connection
+            .profiles
+            .iter()
+            .find(|p| {
+                p.id != profile.id
+                    && p.host == profile.host
+                    && p.port == profile.port
+                    && p.database == profile.database
+                    && p.username == profile.username
+            })
+            .map(|p| (p.id.clone(), p.generated_name()))
+    }
+
+    /// Upsert profile, save via repo, then connect.
+    fn upsert_profile_and_connect(
+        &mut self,
+        profile: ConnectionProfile,
+        password: String,
+        pool: PgPool,
+    ) {
+        // Upsert
+        if let Some(existing) = self
+            .connection
+            .profiles
+            .iter_mut()
+            .find(|p| p.id == profile.id)
+        {
+            *existing = profile.clone();
+        } else {
+            self.connection.profiles.push(profile.clone());
+        }
+        // Save via repo (surfaces errors)
+        if let Err(e) = self.connection.repo.save(&self.connection.profiles) {
+            self.query.status = format!("Failed to save profile: {}", e);
+            return;
+        }
+        // Connect
+        self.finish_connect(profile.id, password, pool);
+    }
+
+    /// Finalize connection after profile saved (no duplicate or user confirmed).
+    fn finish_connect(&mut self, profile_id: String, password: String, pool: PgPool) {
+        self.connection.active_id = Some(profile_id.clone());
+        self.connection.active_password = Some(password);
+        self.connection.active_pool = Some(pool);
+        self.query.expanded_connections.insert(profile_id);
+        self.clear_query_state();
+        self.start_post_connect_load();
+        self.query.status = "Connected".into();
+    }
+
+    /// Commit pending duplicate save (user clicked "Save anyway").
+    fn commit_pending_save(&mut self, profile: ConnectionProfile, pool: PgPool) {
+        let password = self.connection.dialog.password.clone();
+        self.upsert_profile_and_connect(profile, password, pool);
+    }
+
+    /// Called when user confirms "Save anyway" in the dialog.
+    pub fn confirm_duplicate_save(&mut self) {
+        if let Some((_warn, profile, pool)) = self.connection.dialog.pending_duplicate.take() {
+            self.upsert_profile_and_connect(profile, self.connection.dialog.password.clone(), pool);
+            self.connection.dialog.close();
+        }
+    }
+
+    /// Submit password from password prompt (test connection).
+    pub fn submit_password_prompt(&mut self) {
+        let prompt = &mut self.connection.password_prompt;
+        if prompt.submitting {
+            return;
+        }
+        prompt.error = None;
+        prompt.submitting = true;
+        // Find the profile to get the URL for testing
+        if let Some(profile) = self
+            .connection
+            .profiles
+            .iter()
+            .find(|p| p.id == prompt.profile_id)
+            .cloned()
+        {
+            let url = profile.connection_url(&prompt.password);
+            prompt.test_promise = Some(Promise::spawn_async(async move {
+                db::connect_with_url(&url).await
+            }));
+        } else {
+            prompt.error = Some("Profile not found".into());
+            prompt.submitting = false;
+        }
+    }
+
+    /// Cancel password prompt.
+    pub fn cancel_password_prompt(&mut self) {
+        self.connection.password_prompt.close();
+    }
+
+    /// Open the edit dialog for a profile, fetching the password from the secret store.
+    pub fn open_edit_profile(&mut self, profile_id: &str) {
+        if let Some(profile) = self
+            .connection
+            .profiles
+            .iter()
+            .find(|p| p.id == profile_id)
+            .cloned()
+        {
+            let password = self
+                .connection
+                .secrets
+                .get(&profile.id)
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            self.connection.dialog.open_edit(&profile, &password);
         }
     }
 
@@ -673,8 +1147,72 @@ impl AppState {
                 Some(Err(e)) => {
                     self.query.status = format!("Connection failed: {e}");
                     self.connection.active_id = None;
+                    self.connection.active_password = None;
                     self.connect_promise = None;
                     changed = true;
+                }
+            }
+        }
+
+        // Poll password prompt
+        if self.connection.password_prompt.submitting {
+            if let Some(promise) = self.connection.password_prompt.test_promise.take() {
+                match promise.ready() {
+                    None => {
+                        self.connection.password_prompt.test_promise = Some(promise);
+                    }
+                    Some(Ok(pool)) => {
+                        let pool = pool.clone();
+                        // Extract values from prompt before mutably borrowing self for method calls
+                        let profile_id = self.connection.password_prompt.profile_id.clone();
+                        let password = self.connection.password_prompt.password.clone();
+                        let pending_duplicate =
+                            self.connection.password_prompt.pending_duplicate.take();
+                        let remember = self.connection.password_prompt.remember;
+                        let prompt_ptr: *mut PasswordPrompt =
+                            &mut self.connection.password_prompt as *mut _;
+                        // Save secret if remember checked
+                        if remember {
+                            if let Err(e) = self.connection.secrets.set(&profile_id, &password) {
+                                // Need to re-borrow to set error
+                                unsafe {
+                                    (*prompt_ptr).error =
+                                        Some(format!("Failed to save password: {}", e));
+                                }
+                                unsafe {
+                                    (*prompt_ptr).submitting = false;
+                                }
+                                changed = true;
+                            } else {
+                                // Secret saved, now commit pending duplicate if any
+                                if let Some((_warn, profile, pool)) = pending_duplicate {
+                                    self.commit_pending_save(profile, pool);
+                                } else {
+                                    self.finish_connect(profile_id, password, pool);
+                                }
+                                unsafe {
+                                    (*prompt_ptr).close();
+                                }
+                                changed = true;
+                            }
+                        } else {
+                            // Not remembering, just connect
+                            if let Some((_warn, profile, pool)) = pending_duplicate {
+                                self.commit_pending_save(profile, pool);
+                            } else {
+                                self.finish_connect(profile_id, password, pool);
+                            }
+                            unsafe {
+                                (*prompt_ptr).close();
+                            }
+                            changed = true;
+                        }
+                    }
+                    Some(Err(e)) => {
+                        self.connection.password_prompt.error = Some(format!("{e}"));
+                        self.connection.password_prompt.submitting = false;
+                        changed = true;
+                    }
                 }
             }
         }
@@ -684,29 +1222,37 @@ impl AppState {
             match p.ready() {
                 None => {}
                 Some(Ok(pool)) => {
+                    let pool = pool.clone();
                     let profile = self.connection.dialog.build_profile();
-                    // Upsert profile: replace if same ID exists, otherwise push
-                    if let Some(existing) = self
-                        .connection
-                        .profiles
-                        .iter_mut()
-                        .find(|p| p.id == profile.id)
-                    {
-                        *existing = profile.clone();
+                    let password = self.connection.dialog.password.clone();
+
+                    // Save secret FIRST
+                    if let Err(e) = self.connection.secrets.set(&profile.id, &password) {
+                        self.connection.dialog.error =
+                            Some(format!("Failed to save password: {}", e));
+                        self.connection.dialog.testing = false;
+                        self.connection.dialog.test_promise = None;
+                        changed = true;
                     } else {
-                        self.connection.profiles.push(profile.clone());
+                        // Secret saved. Check for duplicate (same host+port+db+user, different id).
+                        let duplicate = self.find_duplicate(&profile);
+                        if let Some((_other_id, other_name)) = duplicate {
+                            // Store pending and show warning in dialog
+                            self.connection.dialog.pending_duplicate = Some((
+                                format!(
+                                    "Same server already saved as \"{}\". Save anyway?",
+                                    other_name
+                                ),
+                                profile,
+                                pool,
+                            ));
+                            self.connection.dialog.testing = false;
+                        } else {
+                            // No duplicate, save profile and connect
+                            self.upsert_profile_and_connect(profile, password, pool);
+                        }
+                        changed = true;
                     }
-                    let _ = crate::connections::save_profiles(&self.connection.profiles);
-                    // Connect
-                    self.query.expanded_connections.insert(profile.id.clone());
-                    self.connection.active_id = Some(profile.id);
-                    self.connection.active_pool = Some(pool.clone());
-                    self.connection.dialog.close();
-                    self.clear_query_state();
-                    self.start_post_connect_load();
-                    self.query.status = "Connected".into();
-                    self.connection.dialog.test_promise = None;
-                    changed = true;
                 }
                 Some(Err(e)) => {
                     self.connection.dialog.error = Some(format!("{e}"));
@@ -902,6 +1448,23 @@ impl AppState {
             }
         }
 
+        // Handle "Save anyway" confirmation from connection dialog duplicate warning.
+        if self.connection.dialog.confirm_duplicate_save_requested {
+            self.connection.dialog.confirm_duplicate_save_requested = false;
+            self.confirm_duplicate_save();
+            changed = true;
+        }
+
+        // Poll drop schema promise
+        if self.poll_drop_schema() {
+            changed = true;
+        }
+
+        // Poll schema name dialog promise (create/rename)
+        if self.poll_schema_name() {
+            changed = true;
+        }
+
         changed
     }
 
@@ -912,6 +1475,16 @@ impl AppState {
             || self.query.db_schema_promise.is_some()
             || self.query.query_promise.is_some()
             || self.query.explain_promise.is_some()
+            || self
+                .query
+                .drop_schema
+                .as_ref()
+                .is_some_and(|d| d.promise.is_some())
+            || self
+                .query
+                .schema_name_dialog
+                .as_ref()
+                .is_some_and(|d| d.promise.is_some())
     }
 
     /// Kick off the database-level extension list for a connected pool.
@@ -954,7 +1527,10 @@ impl AppState {
     /// by expanding its node in the schema tree. No-op when already loaded or
     /// when a load is already in flight for that table.
     pub fn start_load_table_details(&mut self, db: Option<&str>, schema: &str, table: &str) {
-        if self.find_table_mut(db, schema, table).is_some_and(|t| t.detail_loaded) {
+        if self
+            .find_table_mut(db, schema, table)
+            .is_some_and(|t| t.detail_loaded)
+        {
             return;
         }
         if let Some((d, s, t, _)) = &self.query.table_detail_promise
@@ -980,9 +1556,9 @@ impl AppState {
             db.map(str::to_owned),
             schema.clone(),
             table.clone(),
-            Promise::spawn_async(async move {
-                db::load_table_details(&pool, &schema, &table).await
-            }),
+            Promise::spawn_async(
+                async move { db::load_table_details(&pool, &schema, &table).await },
+            ),
         ));
     }
 
@@ -1051,9 +1627,11 @@ impl AppState {
         } else {
             "Running EXPLAIN...".into()
         };
-        let handle = self
-            .rt
-            .spawn(async move { db::execute_explain(&pool, &sql, analyze).await.map(|p| (p, analyze)) });
+        let handle = self.rt.spawn(async move {
+            db::execute_explain(&pool, &sql, analyze)
+                .await
+                .map(|p| (p, analyze))
+        });
         self.query.explain_cancel = Some(handle.abort_handle());
         self.query.explain_promise = Some(Promise::spawn_async(async move {
             match handle.await {
@@ -1294,11 +1872,7 @@ impl AppState {
             } else {
                 fields.push(RowEditField {
                     column: name.clone(),
-                    column_type: result
-                        .column_types
-                        .get(ci)
-                        .cloned()
-                        .unwrap_or_default(),
+                    column_type: result.column_types.get(ci).cloned().unwrap_or_default(),
                     nullable: col.nullable,
                     original_value: value.clone(),
                     value,

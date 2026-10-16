@@ -2,29 +2,28 @@
 name    = "pgTool"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 
 [[bin]]
 name = "pgqb"
 path = "src/main.rs"
 
 [dependencies]
-# ── async runtime ─────────────────────────────
+# -- async runtime --
 tokio        = { version = "1", features = ["full"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
-# ── postgres driver ───────────────────────────
+# -- postgres driver --
 sqlx         = { version = "0.8", features = [
     "postgres",
     "runtime-tokio-native-tls",
-    "macros",
-    "migrate",
     "uuid",
     "chrono",
 ] }
 
-# ── GUI framework ─────────────────────────────
+# -- GUI framework --
 eframe       = { version = "0.36", default-features = false, features = [
-    "glow",           # OpenGL renderer (wgpu backend disabled: unused + dep conflicts)
+    "glow",
     "default_fonts",
     "accesskit",
     "persistence",
@@ -32,32 +31,36 @@ eframe       = { version = "0.36", default-features = false, features = [
 egui         = "0.36"
 egui_extras  = { version = "0.36" }
 
-# ── async bridge for egui ─────────────────────
+# -- async bridge for egui --
 # lets you fire off tokio tasks and poll results each frame
 poll-promise = { version = "0.3", features = ["tokio"] }
 
-# ── SQL query builder ─────────────────────────
+# -- SQL query builder --
 sea-query    = { version = "0.31", features = ["backend-postgres"] }
 
-# ── config & env ──────────────────────────────
+# -- config & env --
 dotenvy      = "0.15"
 
-# ── type support for sqlx decoding ────────────
-uuid         = { version = "1", features = ["v4"] }
+# -- type support for sqlx decoding --
+uuid         = { version = "1", features = ["v4", "serde"] }
 chrono       = "0.4"
 
-# ── OS integration ────────────────────────────
+# -- OS integration --
 dirs         = "5"
 
-# ── error handling ────────────────────────────
+# -- secrets / keyring --
+keyring      = { version = "3", features = ["apple-native", "windows-native"] }
+secrecy      = "0.8"
+
+# -- error handling --
 anyhow       = "1"
 thiserror    = "1"
 
-# ── serialization ─────────────────────────────
+# -- serialization --
 serde        = { version = "1", features = ["derive"] }
 serde_json   = "1"
 
-# ── logging ───────────────────────────────────
+# -- logging --
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 egui-phosphor = "0.13.0"

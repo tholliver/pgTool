@@ -63,9 +63,12 @@ fn draw_header_row(
             );
         }
         ui.label(
-            egui::RichText::new(format!("\u{2014} {elapsed} ms", elapsed = explain.elapsed_ms))
-                .color(theme.text_muted)
-                .size(11.5),
+            egui::RichText::new(format!(
+                "\u{2014} {elapsed} ms",
+                elapsed = explain.elapsed_ms
+            ))
+            .color(theme.text_muted)
+            .size(11.5),
         );
         ui.add(
             egui::Label::new(
@@ -94,11 +97,15 @@ fn draw_header_row(
             let pretty = state.query.explain_pretty;
             let raw_sel = ui.selectable_label(
                 !pretty,
-                egui::RichText::new("Raw").color(theme.text_muted).size(10.5),
+                egui::RichText::new("Raw")
+                    .color(theme.text_muted)
+                    .size(10.5),
             );
             let pretty_sel = ui.selectable_label(
                 pretty,
-                egui::RichText::new("Pretty").color(theme.text_muted).size(10.5),
+                egui::RichText::new("Pretty")
+                    .color(theme.text_muted)
+                    .size(10.5),
             );
             if raw_sel.clicked() && pretty {
                 state.query.explain_pretty = false;

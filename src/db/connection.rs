@@ -1,11 +1,11 @@
 use anyhow::Result;
-use sqlx::{postgres::PgPoolOptions, PgPool};
+use sqlx::{PgPool, postgres::PgPoolOptions};
 use std::env;
 use std::time::Duration;
 
 pub async fn connect() -> Result<PgPool> {
-    let url = env::var("DATABASE_URL")
-        .map_err(|_| anyhow::anyhow!("DATABASE_URL not set in .env"))?;
+    let url =
+        env::var("DATABASE_URL").map_err(|_| anyhow::anyhow!("DATABASE_URL not set in .env"))?;
     connect_with_url(&url).await
 }
 
