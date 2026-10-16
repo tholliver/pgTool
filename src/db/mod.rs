@@ -5,7 +5,7 @@ pub mod query;
 pub mod query_error;
 
 #[allow(unused_imports)]
-pub use connection::{connect, connect_with_url};
+pub use connection::{connect, connect_server, connect_with_url};
 #[allow(unused_imports)]
 pub use introspect::{
     list_databases, load_extensions, load_foreign_keys, load_functions, load_indexes, load_schemas,

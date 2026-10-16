@@ -38,6 +38,14 @@ type DbSchemaPromise = Promise<anyhow::Result<(PgPool, Vec<db::SchemaInfo>)>>;
 /// the table's indexes/foreign-keys/triggers.
 type TableDetailPromise = Promise<anyhow::Result<db::TableDetails>>;
 
+/// Identifier rules for a new database name (Postgres caps identifiers at 63
+/// bytes; the name is quoted, so case and spaces are preserved).
+fn validate_database_name(name: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(!name.is_empty(), "Database name cannot be empty");
+    anyhow::ensure!(name.len() <= 63, "Database name is too long (max 63 bytes)");
+    Ok(())
+}
+
 /// Modal password prompt for a saved connection with no stored secret.
 #[derive(Default)]
 pub struct PasswordPrompt {
@@ -100,10 +108,8 @@ pub struct ConnectionDialog {
     pub name: String,
     pub host: String,
     pub port: String,
+    /// Empty => browse-all mode: list every database on this server.
     pub database: String,
-    /// When true, the Database field is ignored and the connection lists
-    /// every database on the server.
-    pub browse_all_databases: bool,
     pub username: String,
     pub password: String,
     pub ssl_mode: SslMode,
@@ -127,7 +133,6 @@ impl Default for ConnectionDialog {
             host: "localhost".into(),
             port: "5432".into(),
             database: String::new(),
-            browse_all_databases: false,
             username: "postgres".into(),
             password: String::new(),
             ssl_mode: SslMode::Disable,
@@ -149,7 +154,6 @@ impl ConnectionDialog {
         self.host = "localhost".into();
         self.port = "5432".into();
         self.database.clear();
-        self.browse_all_databases = false;
         self.username = "postgres".into();
         self.password.clear();
         self.ssl_mode = SslMode::Disable;
@@ -166,7 +170,6 @@ impl ConnectionDialog {
         self.host = profile.host.clone();
         self.port = profile.port.to_string();
         self.database = profile.database.clone().unwrap_or_default();
-        self.browse_all_databases = profile.browse_all_databases();
         self.username = profile.username.clone();
         self.password = password.to_string();
         self.ssl_mode = profile.ssl_mode.clone();
@@ -186,10 +189,12 @@ impl ConnectionDialog {
 
     pub fn build_profile(&self) -> ConnectionProfile {
         let port = self.port.parse::<u16>().unwrap_or(5432);
-        let database = if self.browse_all_databases {
+        // Empty Database field => browse-all mode (profile.database == None).
+        let db = self.database.trim();
+        let database = if db.is_empty() {
             None
         } else {
-            Some(self.database.clone())
+            Some(db.to_string())
         };
         let name = if self.name.trim().is_empty() {
             format!("{}:{}", self.host, port)
@@ -205,20 +210,17 @@ impl ConnectionDialog {
             username: self.username.clone(),
             ssl_mode: self.ssl_mode.clone(),
             ssl_ca_path: None,
+            initial_database: None,
         }
-    }
-
-    pub fn connection_url(&self) -> String {
-        let profile = self.build_profile();
-        profile.connection_url(&self.password)
     }
 
     pub fn start_test(&mut self) {
         self.error = None;
         self.testing = true;
-        let url = self.connection_url();
+        let profile = self.build_profile();
+        let password = self.password.clone();
         self.test_promise = Some(Promise::spawn_async(async move {
-            crate::db::connect_with_url(&url).await
+            crate::db::connect_server(&profile, &password).await
         }));
     }
 }
@@ -450,13 +452,19 @@ pub struct DropSchemaDialog {
 pub enum SchemaNameMode {
     Create,
     Rename,
+    /// CREATE DATABASE on the connected server (see `open_create_database`).
+    CreateDatabase,
 }
 
-/// Modal dialog shared by "New schema" and "Rename schema".
+/// Modal dialog shared by "New schema", "Rename schema" and "New database".
 pub struct SchemaNameDialog {
     pub mode: SchemaNameMode,
-    /// Some(db) in browse-all mode, None in single-database mode.
+    /// Some(db) in browse-all mode, None in single-database mode (and for
+    /// CreateDatabase, which always runs against the active pool).
     pub database: Option<String>,
+    /// Source database to clone (CreateDatabase only): `CREATE DATABASE new
+    /// TEMPLATE old`.
+    pub template: Option<String>,
     /// Existing name (Rename only; empty for Create).
     pub old_name: String,
     pub name: String,
@@ -776,6 +784,7 @@ impl AppState {
         self.query.schema_name_dialog = Some(SchemaNameDialog {
             mode: SchemaNameMode::Create,
             database: database.map(str::to_string),
+            template: None,
             old_name: String::new(),
             name: String::new(),
             focused: false,
@@ -791,8 +800,24 @@ impl AppState {
         self.query.schema_name_dialog = Some(SchemaNameDialog {
             mode: SchemaNameMode::Rename,
             database: database.map(str::to_string),
+            template: None,
             old_name: schema.to_string(),
             name: schema.to_string(),
+            focused: false,
+            error: None,
+            promise: None,
+        });
+    }
+
+    /// Prompt for a new database name on the currently connected server.
+    /// `template = Some(db)` clones that database (`CREATE DATABASE … TEMPLATE …`).
+    pub fn open_create_database(&mut self, template: Option<&str>) {
+        self.query.schema_name_dialog = Some(SchemaNameDialog {
+            mode: SchemaNameMode::CreateDatabase,
+            database: None,
+            template: template.map(str::to_string),
+            old_name: String::new(),
+            name: String::new(),
             focused: false,
             error: None,
             promise: None,
@@ -811,7 +836,12 @@ impl AppState {
             return;
         }
         let name = d.name.trim().to_string();
-        if let Err(e) = crate::db::validate_schema_name(&name) {
+        if d.mode == SchemaNameMode::CreateDatabase {
+            if let Err(e) = validate_database_name(&name) {
+                d.error = Some(e.to_string());
+                return;
+            }
+        } else if let Err(e) = crate::db::validate_schema_name(&name) {
             d.error = Some(e.to_string());
             return;
         }
@@ -820,15 +850,37 @@ impl AppState {
             return;
         }
         let Some(pool) = pool else {
-            d.error = Some("No open connection for this database".into());
+            d.error = Some(
+                if d.mode == SchemaNameMode::CreateDatabase {
+                    "No active connection to the server"
+                } else {
+                    "No open connection for this database"
+                }
+                .into(),
+            );
             return;
         };
         d.error = None;
-        let (mode, old) = (d.mode, d.old_name.clone());
+        let (mode, old, template) = (d.mode, d.old_name.clone(), d.template.clone());
         d.promise = Some(Promise::spawn_async(async move {
             match mode {
                 SchemaNameMode::Create => crate::db::create_schema(&pool, &name).await,
                 SchemaNameMode::Rename => crate::db::rename_schema(&pool, &old, &name).await,
+                SchemaNameMode::CreateDatabase => {
+                    let sql = match template {
+                        Some(src) => format!(
+                            "CREATE DATABASE {} TEMPLATE {}",
+                            crate::db::query::quote_ident(&name),
+                            crate::db::query::quote_ident(&src)
+                        ),
+                        None => format!("CREATE DATABASE {}", crate::db::query::quote_ident(&name)),
+                    };
+                    sqlx::raw_sql(&sql)
+                        .execute(&pool)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("CREATE DATABASE \"{name}\" failed: {e}"))?;
+                    Ok(())
+                }
             }
         }));
     }
@@ -859,12 +911,20 @@ impl AppState {
                 let Some(d) = self.query.schema_name_dialog.take() else {
                     return true;
                 };
-                self.reload_schemas(d.database.as_deref());
-                let verb = match d.mode {
-                    SchemaNameMode::Create => "created",
-                    SchemaNameMode::Rename => "renamed",
-                };
-                self.query.status = format!("Schema \"{}\" {verb}", d.name.trim());
+                if d.mode == SchemaNameMode::CreateDatabase {
+                    self.query.status = format!("Database \"{}\" created", d.name.trim());
+                    if self.browse_all_active() {
+                        self.start_load_databases();
+                    }
+                } else {
+                    self.reload_schemas(d.database.as_deref());
+                    let verb = match d.mode {
+                        SchemaNameMode::Create => "created",
+                        SchemaNameMode::Rename => "renamed",
+                        SchemaNameMode::CreateDatabase => unreachable!(),
+                    };
+                    self.query.status = format!("Schema \"{}\" {verb}", d.name.trim());
+                }
             }
         }
         true
@@ -960,11 +1020,13 @@ impl AppState {
 
     /// Start async connection with a known password.
     fn start_connect(&mut self, profile: ConnectionProfile, password: String) {
-        let url = profile.connection_url(&password);
         let profile_id = profile.id.clone();
-        let pool_promise =
-            poll_promise::Promise::spawn_async(async move { db::connect_with_url(&url).await });
-        self.query.status = format!("Connecting to {}...", profile.name);
+        let profile_name = profile.name.clone();
+        let pw_for_task = password.clone();
+        let pool_promise = poll_promise::Promise::spawn_async(async move {
+            db::connect_server(&profile, &pw_for_task).await
+        });
+        self.query.status = format!("Connecting to {}...", profile_name);
         self.connection.active_id = Some(profile_id.clone());
         self.connection.active_password = Some(password);
         self.query.expanded_connections.insert(profile_id);
@@ -981,19 +1043,23 @@ impl AppState {
                 p.id != profile.id
                     && p.host == profile.host
                     && p.port == profile.port
-                    && p.database == profile.database
+                    && p.database.as_deref().unwrap_or("")
+                        == profile.database.as_deref().unwrap_or("")
                     && p.username == profile.username
             })
             .map(|p| (p.id.clone(), p.generated_name()))
     }
 
     /// Upsert profile, save via repo, then connect.
+    /// Returns `true` when the profile was persisted and the connection
+    /// finalized; `false` when the repo save failed (caller should keep the
+    /// dialog open so the user can retry).
     fn upsert_profile_and_connect(
         &mut self,
         profile: ConnectionProfile,
         password: String,
         pool: PgPool,
-    ) {
+    ) -> bool {
         // Upsert
         if let Some(existing) = self
             .connection
@@ -1008,10 +1074,11 @@ impl AppState {
         // Save via repo (surfaces errors)
         if let Err(e) = self.connection.repo.save(&self.connection.profiles) {
             self.query.status = format!("Failed to save profile: {}", e);
-            return;
+            return false;
         }
         // Connect
         self.finish_connect(profile.id, password, pool);
+        true
     }
 
     /// Finalize connection after profile saved (no duplicate or user confirmed).
@@ -1026,16 +1093,21 @@ impl AppState {
     }
 
     /// Commit pending duplicate save (user clicked "Save anyway").
-    fn commit_pending_save(&mut self, profile: ConnectionProfile, pool: PgPool) {
+    fn commit_pending_save(&mut self, profile: ConnectionProfile, pool: PgPool) -> bool {
         let password = self.connection.dialog.password.clone();
-        self.upsert_profile_and_connect(profile, password, pool);
+        self.upsert_profile_and_connect(profile, password, pool)
     }
 
     /// Called when user confirms "Save anyway" in the dialog.
     pub fn confirm_duplicate_save(&mut self) {
         if let Some((_warn, profile, pool)) = self.connection.dialog.pending_duplicate.take() {
-            self.upsert_profile_and_connect(profile, self.connection.dialog.password.clone(), pool);
-            self.connection.dialog.close();
+            if self.upsert_profile_and_connect(
+                profile,
+                self.connection.dialog.password.clone(),
+                pool,
+            ) {
+                self.connection.dialog.close();
+            }
         }
     }
 
@@ -1055,9 +1127,9 @@ impl AppState {
             .find(|p| p.id == prompt.profile_id)
             .cloned()
         {
-            let url = profile.connection_url(&prompt.password);
+            let password = prompt.password.clone();
             prompt.test_promise = Some(Promise::spawn_async(async move {
-                db::connect_with_url(&url).await
+                db::connect_server(&profile, &password).await
             }));
         } else {
             prompt.error = Some("Profile not found".into());
@@ -1185,25 +1257,36 @@ impl AppState {
                                 changed = true;
                             } else {
                                 // Secret saved, now commit pending duplicate if any
-                                if let Some((_warn, profile, pool)) = pending_duplicate {
-                                    self.commit_pending_save(profile, pool);
-                                } else {
-                                    self.finish_connect(profile_id, password, pool);
-                                }
+                                let saved =
+                                    if let Some((_warn, profile, pool)) = pending_duplicate {
+                                        self.commit_pending_save(profile, pool)
+                                    } else {
+                                        self.finish_connect(profile_id, password, pool);
+                                        true
+                                    };
                                 unsafe {
-                                    (*prompt_ptr).close();
+                                    if saved {
+                                        (*prompt_ptr).close();
+                                    } else {
+                                        (*prompt_ptr).submitting = false;
+                                    }
                                 }
                                 changed = true;
                             }
                         } else {
                             // Not remembering, just connect
-                            if let Some((_warn, profile, pool)) = pending_duplicate {
-                                self.commit_pending_save(profile, pool);
+                            let saved = if let Some((_warn, profile, pool)) = pending_duplicate {
+                                self.commit_pending_save(profile, pool)
                             } else {
                                 self.finish_connect(profile_id, password, pool);
-                            }
+                                true
+                            };
                             unsafe {
-                                (*prompt_ptr).close();
+                                if saved {
+                                    (*prompt_ptr).close();
+                                } else {
+                                    (*prompt_ptr).submitting = false;
+                                }
                             }
                             changed = true;
                         }
@@ -1223,6 +1306,8 @@ impl AppState {
                 None => {}
                 Some(Ok(pool)) => {
                     let pool = pool.clone();
+                    // Clear the promise immediately so this branch only runs once.
+                    self.connection.dialog.test_promise = None;
                     let profile = self.connection.dialog.build_profile();
                     let password = self.connection.dialog.password.clone();
 
@@ -1231,7 +1316,6 @@ impl AppState {
                         self.connection.dialog.error =
                             Some(format!("Failed to save password: {}", e));
                         self.connection.dialog.testing = false;
-                        self.connection.dialog.test_promise = None;
                         changed = true;
                     } else {
                         // Secret saved. Check for duplicate (same host+port+db+user, different id).
@@ -1247,9 +1331,14 @@ impl AppState {
                                 pool,
                             ));
                             self.connection.dialog.testing = false;
+                        } else if self.upsert_profile_and_connect(profile, password, pool) {
+                            // No duplicate, saved and connected: dismiss the dialog.
+                            // (`close()` also resets `testing`.)
+                            self.connection.dialog.close();
                         } else {
-                            // No duplicate, save profile and connect
-                            self.upsert_profile_and_connect(profile, password, pool);
+                            // Save failed (status already carries the error):
+                            // re-enable the button so the user can retry.
+                            self.connection.dialog.testing = false;
                         }
                         changed = true;
                     }

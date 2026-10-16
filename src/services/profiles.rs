@@ -123,6 +123,7 @@ impl ProfileRepo {
                     username: legacy.username,
                     ssl_mode: legacy.ssl_mode,
                     ssl_ca_path: None,
+                    initial_database: None,
                 };
                 profiles.push(profile);
             }
@@ -146,6 +147,7 @@ impl ProfileRepo {
                 username: legacy.username,
                 ssl_mode: legacy.ssl_mode,
                 ssl_ca_path: None,
+                initial_database: None,
             };
             profiles.push(profile);
         }

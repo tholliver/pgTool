@@ -68,6 +68,7 @@ pub fn show(ctx: &egui::Context, state: &mut AppState, theme: &Theme) {
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .order(egui::Order::Foreground)
         .frame(
             egui::Frame::new()
                 .fill(theme.panel)

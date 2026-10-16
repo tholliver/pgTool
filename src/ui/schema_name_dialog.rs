@@ -1,16 +1,18 @@
 use crate::app::state::{AppState, SchemaNameMode};
 use crate::ui::theme::Theme;
 
-/// Modal used by both "New schema" and "Rename schema".
+/// Modal used by "New schema", "Rename schema" and "New database".
 pub fn show(ctx: &egui::Context, state: &mut AppState, theme: &Theme) {
     let Some(dlg) = state.query.schema_name_dialog.as_mut() else {
         return;
     };
     let (mut confirm, mut cancel) = (false, false);
     let running = dlg.promise.is_some();
+    let is_database = dlg.mode == SchemaNameMode::CreateDatabase;
     let (title, action) = match dlg.mode {
         SchemaNameMode::Create => ("New schema", "Create"),
         SchemaNameMode::Rename => ("Rename schema", "Rename"),
+        SchemaNameMode::CreateDatabase => ("New database", "Create"),
     };
 
     egui::Window::new(title)
@@ -26,6 +28,13 @@ pub fn show(ctx: &egui::Context, state: &mut AppState, theme: &Theme) {
                         .size(12.0),
                 );
             }
+            if let Some(tmpl) = &dlg.template {
+                ui.label(
+                    egui::RichText::new(format!("Template: {tmpl}"))
+                        .color(theme.text_muted)
+                        .size(12.0),
+                );
+            }
             if dlg.mode == SchemaNameMode::Rename {
                 ui.label(
                     egui::RichText::new(format!("Current name: {}", dlg.old_name))
@@ -37,7 +46,7 @@ pub fn show(ctx: &egui::Context, state: &mut AppState, theme: &Theme) {
             let edit = ui.add_enabled(
                 !running,
                 egui::TextEdit::singleline(&mut dlg.name)
-                    .hint_text("schema_name")
+                    .hint_text(if is_database { "database_name" } else { "schema_name" })
                     .desired_width(f32::INFINITY),
             );
             if !dlg.focused {

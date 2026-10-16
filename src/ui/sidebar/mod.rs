@@ -26,7 +26,7 @@ pub fn show_tree(ui: &mut egui::Ui, state: &mut AppState, theme: &Theme) {
                     .fill(egui::Color32::TRANSPARENT)
                     .corner_radius(4),
                 )
-                .on_hover_text("Add Database")
+                .on_hover_text("Add Connection")
                 .clicked()
             {
                 state.connection.dialog.open_add();
@@ -214,6 +214,37 @@ pub fn show_tree(ui: &mut egui::Ui, state: &mut AppState, theme: &Theme) {
                     state.open_edit_profile(&profile.id);
                     ui.close();
                 }
+                // Add a database to the server this connection is opened on.
+                // Only possible while connected (CREATE DATABASE needs a
+                // live session); the clone sources are the databases already
+                // listed for this connection.
+                ui.menu_button("Add new database", |ui| {
+                    ui.add_enabled_ui(is_active, |ui| {
+                        if ui.button("Empty database…").clicked() {
+                            state.open_create_database(None);
+                            ui.close();
+                        }
+                        let sources: Vec<String> = if is_active {
+                            state.query.databases.iter().map(|d| d.name.clone()).collect()
+                        } else {
+                            Vec::new()
+                        };
+                        if !sources.is_empty() {
+                            ui.separator();
+                            ui.label(
+                                egui::RichText::new("Clone from")
+                                    .color(theme.text_muted)
+                                    .size(11.0),
+                            );
+                            for name in sources {
+                                if ui.button(&name).clicked() {
+                                    state.open_create_database(Some(&name));
+                                    ui.close();
+                                }
+                            }
+                        }
+                    });
+                });
                 if is_active
                     && !profile.browse_all_databases()
                     && ui.small_button("New schema…").clicked()

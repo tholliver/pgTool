@@ -15,26 +15,35 @@ pub fn show(ctx: &egui::Context, dialog: &mut ConnectionDialog, theme: &Theme) {
             ui.painter().rect_filled(
                 screen,
                 egui::CornerRadius::ZERO,
-                egui::Color32::from_rgba_premultiplied(0, 0, 0, 150),
+                egui::Color32::from_black_alpha(110),
             );
+            // Consume pointer events so nothing behind the dialog reacts.
+            ui.allocate_rect(screen, egui::Sense::click_and_drag());
         });
 
     let title = if dialog.editing_id.is_some() {
-        "Edit Database"
+        "Edit Connection"
     } else {
-        "Add Database"
+        "Add Connection"
     };
 
     egui::Window::new(title)
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .order(egui::Order::Foreground)
         .frame(
             egui::Frame::new()
-                .fill(theme.panel)
+                .fill(theme.surface)
                 .corner_radius(8)
                 .inner_margin(egui::Margin::symmetric(24, 20))
-                .stroke(egui::Stroke::new(1.0, theme.border)),
+                .stroke(egui::Stroke::new(1.0, theme.border))
+                .shadow(egui::Shadow {
+                    offset: [0, 8],
+                    blur: 24,
+                    spread: 0,
+                    color: egui::Color32::from_black_alpha(120),
+                }),
         )
         .show(ctx, |ui| {
             ui.set_min_width(320.0);
@@ -55,15 +64,6 @@ pub fn show(ctx: &egui::Context, dialog: &mut ConnectionDialog, theme: &Theme) {
             );
             ui.add_space(4.0);
 
-            ui.checkbox(
-                &mut dialog.browse_all_databases,
-                "Browse all databases on this server",
-            )
-            .on_hover_text(
-                "Connect at the server level and list every database.\n\
-                 The Database field below is ignored.",
-            );
-
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
                     field_label(ui, theme, "Port");
@@ -74,18 +74,12 @@ pub fn show(ctx: &egui::Context, dialog: &mut ConnectionDialog, theme: &Theme) {
                     );
                 });
                 ui.vertical(|ui| {
-                    field_label(ui, theme, "Database");
-                    ui.add_enabled_ui(!dialog.browse_all_databases, |ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut dialog.database)
-                                .desired_width(f32::INFINITY)
-                                .hint_text(if dialog.browse_all_databases {
-                                    "all databases"
-                                } else {
-                                    "postgres"
-                                }),
-                        );
-                    });
+                    field_label(ui, theme, "Database (leave empty to show all)");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut dialog.database)
+                            .desired_width(f32::INFINITY)
+                            .hint_text("all databases"),
+                    );
                 });
             });
             ui.add_space(4.0);
